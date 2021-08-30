@@ -205,6 +205,9 @@ struct spdk_bs_opts {
 	/** Size of cluster in bytes. Must be multiple of 4KiB page size. */
 	uint32_t cluster_sz;
 
+	/** Size of slice in bytes. Must be multiple of 4KiB page size. */
+	uint32_t slice_sz;
+
 	/** Count of the number of pages reserved for metadata */
 	uint32_t num_md_pages;
 
@@ -335,6 +338,15 @@ void spdk_bs_get_super(struct spdk_blob_store *bs,
 uint64_t spdk_bs_get_cluster_size(struct spdk_blob_store *bs);
 
 /**
+ * Get the slice size in bytes.
+ *
+ * \param bs blobstore to query.
+ *
+ * \return slice size.
+ */
+uint64_t spdk_bs_get_slice_size(struct spdk_blob_store *bs);
+
+/**
  * Get the page size in bytes. This is the write and read granularity of blobs.
  *
  * \param bs blobstore to query.
@@ -369,6 +381,23 @@ uint64_t spdk_bs_free_cluster_count(struct spdk_blob_store *bs);
  * \return the total number of clusters accessible by user.
  */
 uint64_t spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs);
+
+/**
+ * Get the total number of slices in blobstore.
+ * 
+ * @param bs blobstore to query.
+ * @return the total number of slices in blobstore. 
+ */
+uint64_t spdk_bs_total_slices_count(struct spdk_blob_store *bs);
+
+/**
+ * Get the valid number of slices in blobstore.
+ *
+ * \param bs blobstore to query.
+ *
+ * \return the valid number of slices in blobstore.
+ */
+uint64_t spdk_bs_valid_slices_count(struct spdk_blob_store *bs);
 
 /**
  * Get the blob id.

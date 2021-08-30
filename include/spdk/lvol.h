@@ -71,6 +71,7 @@ enum lvs_clear_method {
  */
 struct spdk_lvs_opts {
 	uint32_t		cluster_sz;
+	uint32_t		slice_sz;
 	enum lvs_clear_method	clear_method;
 	char			name[SPDK_LVS_NAME_MAX];
 };

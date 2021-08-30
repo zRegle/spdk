@@ -44,6 +44,7 @@ struct rpc_bdev_lvol_create_lvstore {
 	char *lvs_name;
 	char *bdev_name;
 	uint32_t cluster_sz;
+	uint32_t slice_sz;
 	char *clear_method;
 };
 
@@ -88,6 +89,7 @@ free_rpc_bdev_lvol_create_lvstore(struct rpc_bdev_lvol_create_lvstore *req)
 static const struct spdk_json_object_decoder rpc_bdev_lvol_create_lvstore_decoders[] = {
 	{"bdev_name", offsetof(struct rpc_bdev_lvol_create_lvstore, bdev_name), spdk_json_decode_string},
 	{"cluster_sz", offsetof(struct rpc_bdev_lvol_create_lvstore, cluster_sz), spdk_json_decode_uint32, true},
+	{"slice_sz", offsetof(struct rpc_bdev_lvol_create_lvstore, slice_sz), spdk_json_decode_uint32, true},
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create_lvstore, lvs_name), spdk_json_decode_string},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create_lvstore, clear_method), spdk_json_decode_string, true},
 };
@@ -147,7 +149,7 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 		clear_method = LVS_CLEAR_WITH_UNMAP;
 	}
 
-	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
+	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, req.slice_sz, clear_method,
 			      rpc_lvol_store_construct_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, -rc, spdk_strerror(rc));
@@ -987,11 +989,12 @@ static void
 rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *lvs_bdev)
 {
 	struct spdk_blob_store *bs;
-	uint64_t cluster_size;
+	uint64_t cluster_size, slice_size;
 	char uuid[SPDK_UUID_STRING_LEN];
 
 	bs = lvs_bdev->lvs->blobstore;
 	cluster_size = spdk_bs_get_cluster_size(bs);
+	slice_size = spdk_bs_get_slice_size(bs);
 
 	spdk_json_write_object_begin(w);
 
@@ -1009,6 +1012,12 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_named_uint64(w, "block_size", spdk_bs_get_io_unit_size(bs));
 
 	spdk_json_write_named_uint64(w, "cluster_size", cluster_size);
+
+	spdk_json_write_named_uint64(w, "total_slices", spdk_bs_total_slices_count(bs));
+
+	spdk_json_write_named_uint64(w, "valid_slices_count", spdk_bs_valid_slices_count(bs));
+
+	spdk_json_write_named_uint64(w, "slice_size", slice_size);
 
 	spdk_json_write_object_end(w);
 }

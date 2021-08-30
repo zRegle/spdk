@@ -2,13 +2,14 @@ from .helpers import deprecated_alias
 
 
 @deprecated_alias('construct_lvol_store')
-def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None, clear_method=None):
+def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None, slice_sz=None, clear_method=None):
     """Construct a logical volume store.
 
     Args:
         bdev_name: bdev on which to construct logical volume store
         lvs_name: name of the logical volume store to create
         cluster_sz: cluster size of the logical volume store in bytes (optional)
+        slice_sz: slice size of the logical volume store in bytes (optional)
         clear_method: Change clear method for data region. Available: none, unmap, write_zeroes (optional)
 
     Returns:
@@ -17,6 +18,8 @@ def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None, clear
     params = {'bdev_name': bdev_name, 'lvs_name': lvs_name}
     if cluster_sz:
         params['cluster_sz'] = cluster_sz
+    if slice_sz:
+        params['slice_sz'] = slice_sz
     if clear_method:
         params['clear_method'] = clear_method
     return client.call('bdev_lvol_create_lvstore', params)

@@ -47,6 +47,7 @@
  */
 
 #define SPDK_BLOB_OPTS_CLUSTER_SZ (1024 * 1024)
+#define SPDK_BLOB_OPTS_SLICE_SZ (64 * 1024)
 #define SPDK_BLOB_OPTS_NUM_MD_PAGES UINT32_MAX
 #define SPDK_BLOB_OPTS_MAX_MD_OPS 32
 #define SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS 512
@@ -190,6 +191,7 @@ struct spdk_blob_store {
 	struct spdk_bit_pool		*used_clusters;
 	struct spdk_bit_array		*used_blobids;
 	struct spdk_bit_array		*open_blobids;
+	struct spdk_bit_array		*valid_slices;
 
 	pthread_mutex_t			used_clusters_mutex;
 
@@ -200,6 +202,12 @@ struct spdk_blob_store {
 	uint64_t			pages_per_cluster;
 	uint8_t				pages_per_cluster_shift;
 	uint32_t			io_unit_size;
+
+	uint32_t			slice_sz;
+	uint64_t			total_slices;
+	uint64_t			num_valid_slices;
+	uint32_t			slices_per_cluster;
+	uint64_t			pages_per_slice;
 
 	spdk_blob_id			super_blob;
 	struct spdk_bs_type		bstype;
@@ -259,6 +267,7 @@ struct spdk_blob_bs_dev {
 #define SPDK_MD_MASK_TYPE_USED_PAGES 0
 #define SPDK_MD_MASK_TYPE_USED_CLUSTERS 1
 #define SPDK_MD_MASK_TYPE_USED_BLOBIDS 2
+#define SPDK_MD_MASK_TYPE_VALID_SLICES 3
 
 struct spdk_bs_md_mask {
 	uint8_t		type;
@@ -409,12 +418,16 @@ struct spdk_bs_super_block {
 	spdk_blob_id	super_blob;
 
 	uint32_t	cluster_size; /* In bytes */
+	uint32_t	slice_size; /* In bytes */
 
 	uint32_t	used_page_mask_start; /* Offset from beginning of disk, in pages */
 	uint32_t	used_page_mask_len; /* Count, in pages */
 
 	uint32_t	used_cluster_mask_start; /* Offset from beginning of disk, in pages */
 	uint32_t	used_cluster_mask_len; /* Count, in pages */
+
+	uint32_t	valid_slice_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	valid_slice_mask_len; /* Count, in pages */
 
 	uint32_t	md_start; /* Offset from beginning of disk, in pages */
 	uint32_t	md_len; /* Count, in pages */
@@ -427,7 +440,7 @@ struct spdk_bs_super_block {
 	uint64_t        size; /* size of blobstore in bytes */
 	uint32_t        io_unit_size; /* Size of io unit in bytes */
 
-	uint8_t         reserved[4000];
+	uint8_t         reserved[3988];
 	uint32_t	crc;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super block size");

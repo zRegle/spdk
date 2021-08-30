@@ -94,7 +94,7 @@ class UILvolStores(UINode):
                                  "lvol store name or UUID")
         self.get_root().bdev_lvol_delete_lvstore(lvs_name=name, uuid=uuid)
 
-    def ui_command_create(self, name, bdev_name, cluster_size=None):
+    def ui_command_create(self, name, bdev_name, cluster_size=None, slice_size=None):
         """
         Creates logical volume store on target bdev.
 
@@ -102,10 +102,11 @@ class UILvolStores(UINode):
         name - Friendly name to use alongside with UUID identifier.
         bdev_name - On which bdev to create the lvol store.
         cluster_size - Cluster size to use when creating lvol store, in bytes. Default: 4194304.
+        slice_size - Slice size to use when creating lvol store, in bytes. Default: 65536.
         """
 
         cluster_size = self.ui_eval_param(cluster_size, "number", None)
-        self.get_root().bdev_lvol_create_lvstore(lvs_name=name, bdev_name=bdev_name, cluster_sz=cluster_size)
+        self.get_root().bdev_lvol_create_lvstore(lvs_name=name, bdev_name=bdev_name, cluster_sz=cluster_size, slice_sz=slice_size)
 
     def ui_command_delete(self, name=None, uuid=None):
         """

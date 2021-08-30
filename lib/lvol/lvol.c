@@ -559,6 +559,7 @@ void
 spdk_lvs_opts_init(struct spdk_lvs_opts *o)
 {
 	o->cluster_sz = SPDK_LVS_OPTS_CLUSTER_SZ;
+	o->slice_sz = SPDK_LVSL_OPTS_SLICE_SZ;
 	o->clear_method = LVS_CLEAR_WITH_UNMAP;
 	memset(o->name, 0, sizeof(o->name));
 }
@@ -569,6 +570,7 @@ setup_lvs_opts(struct spdk_bs_opts *bs_opts, struct spdk_lvs_opts *o)
 	assert(o != NULL);
 	lvs_bs_opts_init(bs_opts);
 	bs_opts->cluster_sz = o->cluster_sz;
+	bs_opts->slice_sz = o->slice_sz;
 	bs_opts->clear_method = (enum bs_clear_method)o->clear_method;
 }
 
