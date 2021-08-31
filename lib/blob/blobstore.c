@@ -3813,6 +3813,9 @@ bs_load_valid_slices_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->bs->num_valid_slices = spdk_bit_array_count_set(ctx->bs->valid_slices);
 	assert(ctx->bs->num_valid_slices <= ctx->bs->total_slices);
 
+	ctx->bs->valid_slices_mask_start = ctx->super->valid_slice_mask_start;
+	ctx->bs->valid_slices_mask_len = ctx->super->valid_slice_mask_len;
+
 	spdk_free(ctx->mask);
 
 	/* Read the used blobids mask */
@@ -4996,6 +4999,15 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 					    SPDK_BS_PAGE_SIZE);
 	num_md_pages += ctx->super->used_cluster_mask_len;
 
+	/* The used_blobids mask requires 1 bit per metadata page, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	ctx->super->used_blobid_mask_start = num_md_pages;
+	ctx->super->used_blobid_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					   spdk_divide_round_up(bs->md_len, 8),
+					   SPDK_BS_PAGE_SIZE);
+	num_md_pages += ctx->super->used_blobid_mask_len;
+
 	/* The valid_slices mask requires 1 bit per slice, rounded
 	 * up to the nearest page, plus a header.
 	 */
@@ -5005,14 +5017,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 						SPDK_BS_PAGE_SIZE);
 	num_md_pages += ctx->super->valid_slice_mask_len;
 
-	/* The used_blobids mask requires 1 bit per metadata page, rounded
-	 * up to the nearest page, plus a header.
-	 */
-	ctx->super->used_blobid_mask_start = num_md_pages;
-	ctx->super->used_blobid_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
-					   spdk_divide_round_up(bs->md_len, 8),
-					   SPDK_BS_PAGE_SIZE);
-	num_md_pages += ctx->super->used_blobid_mask_len;
+	bs->valid_slices_mask_start = ctx->super->valid_slice_mask_start;
+	bs->valid_slices_mask_len = ctx->super->valid_slice_mask_len;
 
 	/* The metadata region size was chosen above */
 	ctx->super->md_start = bs->md_start = num_md_pages;

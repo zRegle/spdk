@@ -208,6 +208,8 @@ struct spdk_blob_store {
 	uint64_t			num_valid_slices;
 	uint32_t			slices_per_cluster;
 	uint64_t			pages_per_slice;
+	uint32_t			valid_slices_mask_start;
+	uint32_t			valid_slices_mask_len;
 
 	spdk_blob_id			super_blob;
 	struct spdk_bs_type		bstype;
