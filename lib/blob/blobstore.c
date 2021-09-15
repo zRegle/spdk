@@ -210,6 +210,90 @@ cleanup:
 	}
 }
 
+static struct cow_sequencer*
+blob_get_cow_sequencer(struct rb_root *root, uint64_t slice)
+{
+	struct rb_node **node = &(root->rb_node), *parent = NULL;
+	struct cow_sequencer *this = NULL;
+
+	while (*node) {
+		this = container_of(*node, struct cow_sequencer, node);
+		parent = *node;
+		if (this->slice > this->slice)
+			node = &((*node)->rb_left);
+		else if (this->slice < this->slice)
+			node = &((*node)->rb_left);
+		else
+			return this;
+	}
+
+	/* not found, create a new sequencer */
+	this = calloc(1, sizeof(*this));
+	if (!this) {
+		SPDK_ERRLOG("calloc failed\n");
+		return this;
+	}
+	this->slice = slice;
+	TAILQ_INIT(&this->pending_ios);
+
+	/* Add new node and rebalance tree. */
+	rb_link_node(&this->node, parent, node);
+	rb_insert_color(&this->node, root);
+
+	return this;
+}
+
+static void
+blob_delete_cow_sequencer(struct rb_root *root, struct cow_sequencer *sequencer)
+{
+	assert(sequencer != NULL);
+	/* remove from rbtree */
+	rb_erase(&sequencer->node, root);
+	free(sequencer);
+}
+
+static struct mapping_sequencer*
+blob_get_mapping_sequencer(struct rb_root *root, uint64_t cluster)
+{
+	struct rb_node **node = &(root->rb_node), *parent = NULL;
+	struct mapping_sequencer *this = NULL;
+
+	while (*node) {
+		this = container_of(*node, struct mapping_sequencer, node);
+		parent = *node;
+		if (this->cluster > this->cluster)
+			node = &((*node)->rb_left);
+		else if (this->cluster < this->cluster)
+			node = &((*node)->rb_left);
+		else
+			return this;
+	}
+
+	/* not found, create a new sequencer */
+	this = calloc(1, sizeof(*this));
+	if (!this) {
+		SPDK_ERRLOG("calloc failed\n");
+		return this;
+	}
+	this->cluster = cluster;
+	TAILQ_INIT(&this->pending_ios);
+
+	/* Add new node and rebalance tree. */
+	rb_link_node(&this->node, parent, node);
+	rb_insert_color(&this->node, root);
+
+	return this;
+}
+
+static void
+blob_delete_mapping_sequencer(struct rb_root *root, struct mapping_sequencer *sequencer)
+{
+	assert(sequencer != NULL);
+	/* remove from rbtree */
+	rb_erase(&sequencer->node, root);
+	free(sequencer);
+}
+
 static void
 blob_verify_md_op(struct spdk_blob *blob)
 {
@@ -452,6 +536,9 @@ blob_alloc(struct spdk_blob_store *bs, spdk_blob_id id)
 	TAILQ_INIT(&blob->xattrs_internal);
 	TAILQ_INIT(&blob->pending_persists);
 	TAILQ_INIT(&blob->persists_to_complete);
+
+	RB_EMPTY_ROOT(&blob->cluster_sequencers_tree);
+	RB_EMPTY_ROOT(&blob->slice_sequencers_tree);
 
 	return blob;
 }

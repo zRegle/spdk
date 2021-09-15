@@ -41,6 +41,8 @@
 
 #include "request.h"
 
+#include "spdk/rbtree.h"
+
 /* In Memory Data Structures
  *
  * The following data structures exist only in memory.
@@ -52,6 +54,22 @@
 #define SPDK_BLOB_OPTS_MAX_MD_OPS 32
 #define SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS 512
 #define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
+
+struct mapping_sequencer {
+	struct rb_node node;
+	uint64_t cluster;
+	uint32_t read_count;
+	spdk_bs_sequence_t *mapping_io;
+	TAILQ_HEAD(, spdk_bs_sequence_t) pending_ios;
+};
+
+struct cow_sequencer {
+	struct rb_node node;
+	uint64_t slice;
+	uint32_t read_count;
+	spdk_bs_sequence_t *cow_io;
+	TAILQ_HEAD(, spdk_bs_sequence_t) pending_ios;
+};
 
 struct spdk_xattr {
 	uint32_t	index;
@@ -174,6 +192,9 @@ struct spdk_blob {
 	/* Number of data clusters retrived from extent table,
 	 * that many have to be read from extent pages. */
 	uint64_t	remaining_clusters_in_et;
+
+	struct rb_root cluster_sequencers_tree;
+	struct rb_root slice_sequencers_tree;
 };
 
 struct spdk_blob_store {
