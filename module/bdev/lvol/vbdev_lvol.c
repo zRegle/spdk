@@ -57,6 +57,19 @@ static struct spdk_bdev_module g_lvol_if = {
 
 SPDK_BDEV_MODULE_REGISTER(lvol, &g_lvol_if)
 
+void 
+vbdev_lvol_get_lvs_mask(struct spdk_lvol_store *lvs, enum lvs_mask_type type,
+				spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct rpc_bdev_lvol_get_lvs_mask_cb_arg *arg = cb_arg;
+	struct spdk_bs_mask_info *info;
+	int bserrno = 0;
+
+	spdk_bs_get_mask(lvs->blobstore, &info, type, &bserrno);
+	arg->info = info;
+	cb_fn(arg, bserrno);
+}
+
 struct lvol_store_bdev *
 vbdev_get_lvs_bdev_by_lvs(struct spdk_lvol_store *lvs_orig)
 {

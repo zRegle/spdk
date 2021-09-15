@@ -229,3 +229,11 @@ def bdev_lvol_get_lvstores(client, uuid=None, lvs_name=None):
     if lvs_name:
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_get_lvstores', params)
+
+def bdev_lvol_get_lvs_mask(client, lvs_name, mask_type=None, output_file=None):
+    params = { 'lvs_name': lvs_name }
+    if mask_type:
+        params['type'] = mask_type
+    if output_file:
+        params['output_file'] = output_file
+    return client.call('bdev_lvol_get_lvs_mask', params)

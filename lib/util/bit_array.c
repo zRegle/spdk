@@ -40,7 +40,6 @@
 #include "spdk/likely.h"
 #include "spdk/util.h"
 
-typedef uint64_t spdk_bit_array_word;
 #define SPDK_BIT_ARRAY_WORD_TZCNT(x)	(__builtin_ctzll(x))
 #define SPDK_BIT_ARRAY_WORD_POPCNT(x)	(__builtin_popcountll(x))
 #define SPDK_BIT_ARRAY_WORD_C(x)	((spdk_bit_array_word)(x))
@@ -48,11 +47,6 @@ typedef uint64_t spdk_bit_array_word;
 #define SPDK_BIT_ARRAY_WORD_BITS	(SPDK_BIT_ARRAY_WORD_BYTES * 8)
 #define SPDK_BIT_ARRAY_WORD_INDEX_SHIFT	spdk_u32log2(SPDK_BIT_ARRAY_WORD_BITS)
 #define SPDK_BIT_ARRAY_WORD_INDEX_MASK	((1u << SPDK_BIT_ARRAY_WORD_INDEX_SHIFT) - 1)
-
-struct spdk_bit_array {
-	uint32_t bit_count;
-	spdk_bit_array_word words[];
-};
 
 struct spdk_bit_array *
 spdk_bit_array_create(uint32_t num_bits)
@@ -362,12 +356,6 @@ spdk_bit_array_clear_mask(struct spdk_bit_array *ba)
 		spdk_bit_array_clear(ba, i + size * CHAR_BIT);
 	}
 }
-
-struct spdk_bit_pool {
-	struct spdk_bit_array	*array;
-	uint32_t		lowest_free_bit;
-	uint32_t		free_count;
-};
 
 struct spdk_bit_pool *
 spdk_bit_pool_create(uint32_t num_bits)

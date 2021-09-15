@@ -1076,3 +1076,148 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_get_lvstores", rpc_bdev_lvol_get_lvstores, SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_lvol_get_lvstores, get_lvol_stores)
+
+
+struct rpc_bdev_lvol_get_lvs_mask {
+	char *lvs_name;
+	char *output_file;
+	char *type;
+};
+
+static void
+free_rpc_bdev_lvol_get_lvs_mask(struct rpc_bdev_lvol_get_lvs_mask *req)
+{
+	if (req->lvs_name)
+		free(req->lvs_name);
+	if (req->output_file)
+		free(req->output_file);
+	if (req->type)
+		free(req->type);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_get_lvs_mask_decoders[] = {
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_get_lvs_mask, lvs_name), spdk_json_decode_string},
+	{"output_file", offsetof(struct rpc_bdev_lvol_get_lvs_mask, output_file), spdk_json_decode_string, true},
+	{"type", offsetof(struct rpc_bdev_lvol_get_lvs_mask, type), spdk_json_decode_string, true}
+};
+
+static void
+free_rpc_bdev_lvol_get_lvs_mask_cb_arg(struct rpc_bdev_lvol_get_lvs_mask_cb_arg *cb_arg) 
+{
+	if (cb_arg) {
+		if (cb_arg->output_file)
+			free(cb_arg->output_file);
+		free(cb_arg);
+	}
+}
+
+static void
+bdev_lvol_get_lvs_mask_cb(void *cb_arg, int bserrno)
+{
+	FILE *fp = NULL;
+	struct rpc_bdev_lvol_get_lvs_mask_cb_arg *arg = cb_arg;
+	struct spdk_bs_mask_info *info = arg->info;
+	struct spdk_jsonrpc_request *request = arg->request;
+
+	if (bserrno) {
+		spdk_jsonrpc_send_error_response(request, bserrno, spdk_strerror(-bserrno));
+		goto cleanup;
+	}
+
+	fp = fopen(arg->output_file, "wb");
+	if (fp == NULL) {
+		SPDK_ERRLOG("fopen failed\n");
+		spdk_jsonrpc_send_error_response(request, errno, spdk_strerror(-errno));
+		goto cleanup;
+	}
+
+	if (fwrite(info->mask, sizeof(uint64_t), info->count, fp) != info->count) {
+		SPDK_ERRLOG("write falied\n");
+		spdk_jsonrpc_send_error_response(request, errno, spdk_strerror(-errno));
+		goto cleanup;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	if (fp != NULL) 
+		fclose(fp);
+	if (info) {
+		if (info->mask)
+			free(info->mask);
+		free(info);
+	}
+	free_rpc_bdev_lvol_get_lvs_mask_cb_arg(arg);
+}
+
+static void
+bdev_lvol_get_lvs_mask(struct spdk_jsonrpc_request *request,
+				const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_get_lvs_mask req = {};
+	struct spdk_lvol_store *lvs = NULL;
+	struct rpc_bdev_lvol_get_lvs_mask_cb_arg *cb_arg = NULL;
+	enum lvs_mask_type type;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_get_lvs_mask_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_get_lvstores_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						"spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	if (req.type != NULL) {
+		if (!strcasecmp(req.type, "valid_slices")) {
+			type = LVS_VALID_SLICES;
+		} else if (!strcasecmp(req.type, "used_page")) {
+			type = LVS_USED_MD_PAGE;
+		} else if (!strcasecmp(req.type, "used_clusters")) {
+			type = LVS_USED_CLUSTERS;
+		} else if (!strcasecmp(req.type, "used_blobids")) {
+			type = LVS_USED_BLOBIDS;
+		} else if (!strcasecmp(req.type, "open_blobids")) {
+			type = LVS_OPEN_BLOBIDS;
+		} else {
+			spdk_jsonrpc_send_error_response(request, -EINVAL, "Invalid mask_type parameter");
+			goto cleanup;
+		}
+	} else {
+		req.type = strdup("valid_slices");
+		type = LVS_VALID_SLICES;
+	}
+
+	lvs = vbdev_get_lvol_store_by_name(req.lvs_name);
+	if (lvs == NULL) {
+		SPDK_INFOLOG(lvol_rpc, "no lvs existing for given name\n");
+		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req.lvs_name);
+		goto cleanup;
+	}
+
+	cb_arg = calloc(1, sizeof(*cb_arg));
+	if (cb_arg == NULL) {
+		spdk_jsonrpc_send_error_response(request, ENOMEM, spdk_strerror(-ENOMEM));
+		goto cleanup;
+	}
+
+	cb_arg->request = request;
+	cb_arg->info = NULL;
+	if (req.output_file) {
+		cb_arg->output_file = strdup(req.output_file);
+	} else {
+		cb_arg->output_file = calloc(128, sizeof(char));
+		if (cb_arg == NULL) {
+			spdk_jsonrpc_send_error_response(request, ENOMEM, spdk_strerror(-ENOMEM));
+			free_rpc_bdev_lvol_get_lvs_mask_cb_arg(cb_arg);
+			goto cleanup;
+		}
+		snprintf(cb_arg->output_file, 128, "/tmp/spdk-%s-%s-mask", req.lvs_name, req.type);
+	}
+
+	vbdev_lvol_get_lvs_mask(lvs, type, bdev_lvol_get_lvs_mask_cb, cb_arg);
+
+cleanup:
+	free_rpc_bdev_lvol_get_lvs_mask(&req);
+}
+SPDK_RPC_REGISTER("bdev_lvol_get_lvs_mask", bdev_lvol_get_lvs_mask, SPDK_RPC_RUNTIME)

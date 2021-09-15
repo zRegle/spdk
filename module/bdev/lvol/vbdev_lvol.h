@@ -127,4 +127,13 @@ struct lvol_store_bdev *vbdev_get_lvs_bdev_by_lvs(struct spdk_lvol_store *lvs);
 
 struct spdk_lvol *vbdev_lvol_get_from_bdev(struct spdk_bdev *bdev);
 
+void vbdev_lvol_get_lvs_mask(struct spdk_lvol_store *lvs, enum lvs_mask_type type, 
+				spdk_lvs_op_complete cb_fn, void *cb_arg);
+
+struct rpc_bdev_lvol_get_lvs_mask_cb_arg {
+	struct spdk_jsonrpc_request *request;
+	char *output_file;
+	struct spdk_bs_mask_info *info;
+};
+
 #endif /* SPDK_VBDEV_LVOL_H */

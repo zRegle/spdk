@@ -47,6 +47,12 @@ extern "C" {
 struct spdk_bit_pool;
 struct spdk_bit_array;
 
+struct spdk_bit_pool {
+	struct spdk_bit_array	*array;
+	uint32_t		lowest_free_bit;
+	uint32_t		free_count;
+};
+
 /**
  * Return the number of bits that a bit pool is currently sized to hold.
  *

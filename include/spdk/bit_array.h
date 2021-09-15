@@ -47,7 +47,11 @@ extern "C" {
 /**
  * Variable-length bit array.
  */
-struct spdk_bit_array;
+typedef uint64_t spdk_bit_array_word;
+struct spdk_bit_array {
+	uint32_t bit_count;
+	spdk_bit_array_word words[];
+};
 
 /**
  * Return the number of bits that a bit array is currently sized to hold.

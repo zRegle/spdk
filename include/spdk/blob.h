@@ -83,6 +83,14 @@ enum bs_clear_method {
 	BS_CLEAR_WITH_NONE,
 };
 
+enum bs_mask_type {
+	BS_USED_MD_PAGE,
+	BS_USED_CLUSTERS,
+	BS_USED_BLOBIDS,
+	BS_OPEN_BLOBIDS,
+	BS_VALID_SLICES
+};
+
 struct spdk_blob_store;
 struct spdk_io_channel;
 struct spdk_blob;
@@ -948,6 +956,12 @@ struct spdk_bs_type spdk_bs_get_bstype(struct spdk_blob_store *bs);
  */
 void spdk_bs_set_bstype(struct spdk_blob_store *bs, struct spdk_bs_type bstype);
 
+struct spdk_bs_mask_info {
+	uint64_t count;
+	uint64_t *mask;
+};
+void spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **info,
+				enum bs_mask_type type, int *bserrno);
 #ifdef __cplusplus
 }
 #endif

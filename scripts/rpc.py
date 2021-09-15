@@ -1720,6 +1720,18 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-l', '--lvs-name', help='lvol store name', required=False)
     p.set_defaults(func=bdev_lvol_get_lvstores)
 
+    def bdev_lvol_get_lvs_mask(args):
+        rpc.lvol.bdev_lvol_get_lvs_mask(args.client,
+                                    lvs_name=args.lvs_name,
+                                    mask_type=args.mask_type,
+                                    output_file=args.output_file)
+
+    p = subparsers.add_parser('bdev_lvol_get_lvs_mask', help='dump blobstore mask to file')
+    p.add_argument('-l', '--lvs-name', help='lvol store name', required=True)
+    p.add_argument('-t', '--mask-type', help='mask type', required=False)
+    p.add_argument('-o', '--output-file', help='output filename', required=False)
+    p.set_defaults(func=bdev_lvol_get_lvs_mask)
+
     def bdev_raid_get_bdevs(args):
         print_array(rpc.bdev.bdev_raid_get_bdevs(args.client,
                                                  category=args.category))

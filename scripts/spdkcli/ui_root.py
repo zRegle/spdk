@@ -204,6 +204,10 @@ class UIRoot(UINode):
     @verbose
     def bdev_lvol_delete_lvstore(self, **kwargs):
         rpc.lvol.bdev_lvol_delete_lvstore(self.client, **kwargs)
+    
+    @verbose
+    def bdev_lvol_get_lvs_mask(self, **kwargs):
+        rpc.lvol.bdev_lvol_get_lvs_mask(self.client, **kwargs)
 
     @verbose
     def bdev_pmem_create_pool(self, **kwargs):

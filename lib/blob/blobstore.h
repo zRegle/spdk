@@ -715,4 +715,19 @@ bs_io_unit_is_allocated(struct spdk_blob *blob, uint64_t io_unit)
 	}
 }
 
+/* Given an cluster into a blobstore, look up the slice into blobstore
+ * to beginning of current cluster */
+static inline uint64_t
+bs_cluster_to_slice(struct spdk_blob_store *bs, uint64_t cluster)
+{
+	return bs->slices_per_cluster * cluster;
+}
+
+/* Given an slice into a blobstore, look up the offset into the cluster
+ * that the slice located */
+static inline uint32_t
+bs_slice_to_cluster_offset(struct spdk_blob_store *bs, uint64_t slice)
+{
+	return slice % bs->slices_per_cluster;
+}
 #endif

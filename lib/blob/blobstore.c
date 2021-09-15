@@ -66,6 +66,150 @@ static int blob_remove_xattr(struct spdk_blob *blob, const char *name, bool inte
 static void blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint64_t cluster_num,
 				   spdk_blob_op_complete cb_fn, void *cb_arg);
 
+#define SLICES_PER_PAGE (SPDK_BS_PAGE_SIZE * CHAR_BIT)
+#define SLICE_MASK_HEADER (sizeof(struct spdk_bs_md_mask) * CHAR_BIT)
+
+static void
+bs_set_slice(struct spdk_blob_store *bs, uint64_t slice)
+{
+	assert(slice < spdk_bit_array_capacity(bs->valid_slices));
+	assert(spdk_bit_array_get(bs->valid_slices, slice) == false);
+	assert(bs->num_valid_slices < bs->total_slices);
+
+	assert(spdk_bit_array_set(bs->valid_slices, slice) == 0);
+	bs->num_valid_slices++;
+}
+
+static void
+bs_clear_slice(struct spdk_blob_store *bs, uint64_t slice)
+{
+	assert(slice < spdk_bit_array_capacity(bs->valid_slices));
+	assert(spdk_bit_array_get(bs->valid_slices, slice) == true);
+	assert(bs->num_valid_slices > 0);
+
+	spdk_bit_array_clear(bs->valid_slices, slice);
+	bs->num_valid_slices--;
+}
+
+static bool
+bs_slice_is_valid(struct spdk_blob_store *bs, uint64_t slice)
+{
+	assert(slice < spdk_bit_array_capacity(bs->valid_slices));
+	assert(bs->num_valid_slices > 0);
+
+	return spdk_bit_array_get(bs->valid_slices, slice);
+}
+
+static inline uint32_t
+bs_slice_to_md_page(struct spdk_blob_store *bs, uint64_t slice)
+{
+	uint32_t md_page;
+
+	assert(slice < bs->total_slices);
+
+	md_page = (slice + SLICE_MASK_HEADER) / SLICES_PER_PAGE;
+
+	return md_page;
+}
+
+static uint64_t
+bs_lba_to_slice(struct spdk_blob_store *bs, uint64_t lba)
+{
+	assert(lba % (bs->slice_sz / bs->dev->blocklen) == 0);
+
+	return lba / (bs->slice_sz / bs->dev->blocklen);
+}
+
+static void
+blob_serialize_slice_page(const struct spdk_blob *blob, 
+			uint64_t slice, void *payload)
+{
+	struct spdk_blob_store *bs = blob->bs;
+	struct spdk_bs_md_mask *mask;
+	uint32_t md_page, first_page_data_bytes;
+	uint64_t bias;
+
+	md_page = bs_slice_to_md_page(bs, slice);
+	first_page_data_bytes = SPDK_BS_PAGE_SIZE - sizeof(struct spdk_bs_md_mask);
+
+	if (!md_page) {
+		mask = (struct spdk_bs_md_mask *)payload;
+		mask->type = SPDK_MD_MASK_TYPE_VALID_SLICES;
+		mask->length = bs->total_slices;
+		memcpy(mask->mask, bs->valid_slices->words, first_page_data_bytes);
+	} else {
+		bias = (md_page - 1) * SPDK_BS_PAGE_SIZE + first_page_data_bytes;
+		memcpy(payload, bs->valid_slices->words + bias, SPDK_BS_PAGE_SIZE);
+	}
+}
+
+void 
+spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **info,
+				enum bs_mask_type type, int *bserrno)
+{
+	struct spdk_bs_mask_info *_info;
+	const uint8_t mask_word_bytes = sizeof(uint64_t); 
+	struct spdk_bit_array *array = NULL;
+	uint64_t bytes_count;
+
+	_info = calloc(1, sizeof(*_info));
+	if (_info == NULL) {
+		SPDK_ERRLOG("malloc failed\n");
+		*bserrno = -ENOMEM;
+		goto cleanup;
+	}
+
+	switch (type) {
+		case BS_VALID_SLICES:
+			array = bs->valid_slices;
+			bytes_count = spdk_divide_round_up(bs->total_slices, mask_word_bytes);
+			break;
+		case BS_USED_CLUSTERS:
+			bytes_count = spdk_divide_round_up(bs->total_clusters, mask_word_bytes);
+			//TODO: cluster bit array;
+			break;
+		case BS_USED_MD_PAGE:
+			array = bs->used_md_pages;
+			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
+			break;
+		case BS_USED_BLOBIDS:
+			array = bs->used_blobids;
+			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
+			break;
+		case BS_OPEN_BLOBIDS:
+			array = bs->open_blobids;
+			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
+			break;
+		default:
+			SPDK_ERRLOG("invalid mask type, %d\n", type);
+			*bserrno = -EINVAL;
+			goto cleanup;
+	}
+
+	_info->mask = malloc(bytes_count);
+	if (_info->mask == NULL) {
+		SPDK_ERRLOG("malloc failed\n");
+		*bserrno = -ENOMEM;
+		goto cleanup;
+	}
+	_info->count = bytes_count / mask_word_bytes;
+
+	memset(_info->mask, 0, bytes_count);
+	memcpy(_info->mask, array->words, bytes_count);
+
+	*info = _info;
+	*bserrno = 0;
+	
+	return;
+
+cleanup:
+	if (_info) {
+		if (_info->mask)
+			free(_info->mask);
+		free(_info);
+	}
+}
+
 static void
 blob_verify_md_op(struct spdk_blob *blob)
 {
@@ -155,6 +299,8 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
 {
 	uint32_t *extent_page = 0;
+	uint64_t start_slice, slice;
+	uint32_t offset;
 
 	*cluster = bs_claim_cluster(blob->bs);
 	if (*cluster == UINT32_MAX) {
@@ -187,6 +333,11 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 		blob_insert_cluster(blob, cluster_num, *cluster);
 		if (blob->use_extent_table && *extent_page == 0) {
 			*extent_page = *lowest_free_md_page;
+		}
+		start_slice = bs_cluster_to_slice(blob->bs, *cluster);
+		for (offset = 0; offset < blob->bs->slices_per_cluster; offset++) {
+			slice = start_slice + offset;
+			bs_set_slice(blob->bs, slice);
 		}
 	}
 
@@ -1603,6 +1754,9 @@ struct spdk_blob_persist_ctx {
 	spdk_bs_sequence_cpl		cb_fn;
 	void				*cb_arg;
 	TAILQ_ENTRY(spdk_blob_persist_ctx) link;
+
+	void *valid_slices_payload;
+	uint64_t cluster_idx;
 };
 
 static void
@@ -2134,6 +2288,55 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 }
 
 static void
+blob_persist_write_valid_slices(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob	*blob = ctx->blob;
+	size_t	i;
+	uint32_t	prev_md_page, cur_md_page;
+	uint64_t	lba, prev_slice, cur_slice;
+	int	rc;
+
+	if (ctx->valid_slices_payload != NULL) {
+		spdk_free(ctx->valid_slices_payload);
+		ctx->valid_slices_payload = NULL;
+	}
+
+	if (bserrno != 0) {
+		blob_persist_complete(seq, ctx, bserrno);
+		return;
+	}
+
+	prev_md_page = prev_slice = UINT32_MAX;
+	for (i = ctx->cluster_idx; i < blob->active.num_clusters; i++) {
+		lba = blob->active.clusters[i];
+		if (lba == 0) continue;
+		cur_slice = bs_lba_to_slice(blob->bs, lba);
+		cur_md_page = bs_slice_to_md_page(blob->bs, cur_slice);
+		if (prev_md_page != UINT32_MAX && prev_md_page != cur_md_page) {
+			ctx->cluster_idx = i;
+			ctx->valid_slices_payload = spdk_malloc(SPDK_BS_PAGE_SIZE, 0,
+				     		NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+			if (ctx->valid_slices_payload == NULL) {
+				rc = -ENOMEM;
+				blob_persist_complete(seq, ctx, rc);
+				return;
+			}
+			blob_serialize_slice_page(blob, prev_slice, ctx->valid_slices_payload);
+			bs_sequence_write_dev(seq, ctx->valid_slices_payload, 
+							bs_md_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + prev_md_page),
+							bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
+							blob_persist_write_valid_slices, ctx);
+			return;
+		}
+		prev_md_page = cur_md_page;
+		prev_slice = cur_slice;
+	}
+
+	blob_persist_generate_new_md(ctx);
+}
+
+static void
 blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_persist_ctx	*ctx = cb_arg;
@@ -2180,7 +2383,7 @@ blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		return;
 	}
 
-	blob_persist_generate_new_md(ctx);
+	blob_persist_write_valid_slices(seq, ctx, 0);
 }
 
 static void
@@ -5065,10 +5268,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	}
 	/* Claim all of the clusters used by the metadata */
 	for (i = 0; i < num_md_slices; i++) {
-		spdk_bit_array_set(bs->valid_slices, i);
+		bs_set_slice(bs, i);
 	}
-
-	bs->num_valid_slices += num_md_slices;
 
 	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
 	cpl.u.bs_handle.cb_fn = cb_fn;
