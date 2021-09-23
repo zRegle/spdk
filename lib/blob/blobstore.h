@@ -55,20 +55,59 @@
 #define SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS 512
 #define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
 
+#define MAPPING_UNSYNC_BIT (1ULL << 63)
+
+struct blob_cow_ctx {
+
+};
+
+struct blob_io_ctx {
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+	uint64_t offset;
+	uint64_t length;
+	bool read;
+	int iovcnt;
+	struct iovec *iovs;
+	spdk_blob_op_complete io_complete_cb;
+	void *io_complete_cb_arg;
+	TAILQ_ENTRY(blob_io_ctx) link;
+	TAILQ_HEAD(, cow_sequencer) sequencers;
+	struct {
+		uint32_t oustanding_ops;
+		uint64_t io_unit_offset;
+		uint64_t io_units_remaining;
+		uint64_t io_units_split;
+	} split_io_ctx;
+	struct {
+		struct spdk_thread *thread;
+		uint64_t new_cluster;
+		uint32_t new_extent_page;
+		void *payload[2];
+		spdk_bs_sequence_t *seq;
+		void *mask_payload;
+	} cow_ctx;
+	uint64_t start_slice;
+	uint64_t end_slice;
+	bool begin_aligned;
+	bool end_aligned;
+};
+
 struct mapping_sequencer {
 	struct rb_node node;
 	uint64_t cluster;
 	uint32_t read_count;
-	spdk_bs_sequence_t *mapping_io;
-	TAILQ_HEAD(, spdk_bs_sequence_t) pending_ios;
+	struct blob_io_ctx *mapping_io;
+	TAILQ_HEAD(, blob_io_ctx) pending_ios;
 };
 
 struct cow_sequencer {
 	struct rb_node node;
 	uint64_t slice;
 	uint32_t read_count;
-	spdk_bs_sequence_t *cow_io;
-	TAILQ_HEAD(, spdk_bs_sequence_t) pending_ios;
+	struct blob_io_ctx *cow_io;
+	TAILQ_HEAD(, blob_io_ctx) pending_ios;
+	TAILQ_ENTRY(cow_sequencer) link;
 };
 
 struct spdk_xattr {
