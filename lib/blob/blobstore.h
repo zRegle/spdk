@@ -86,6 +86,7 @@ struct blob_io_ctx {
 		void *payload[2];
 		spdk_bs_sequence_t *seq;
 		void *mask_payload;
+		bool need_merge_data;
 	} cow_ctx;
 	uint64_t start_slice;
 	uint64_t end_slice;
