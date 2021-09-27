@@ -57,9 +57,8 @@
 
 #define MAPPING_UNSYNC_BIT (1ULL << 63)
 
-struct blob_cow_ctx {
-
-};
+struct cow_sequencer;
+struct mapping_sequencer;
 
 struct blob_io_ctx {
 	struct spdk_blob *blob;
@@ -72,7 +71,7 @@ struct blob_io_ctx {
 	spdk_blob_op_complete io_complete_cb;
 	void *io_complete_cb_arg;
 	TAILQ_ENTRY(blob_io_ctx) link;
-	TAILQ_HEAD(, cow_sequencer) sequencers;
+	TAILQ_HEAD(, cow_sequencer_list_node) sequencers;
 	struct {
 		uint32_t oustanding_ops;
 		uint64_t io_unit_offset;
@@ -108,7 +107,11 @@ struct cow_sequencer {
 	uint32_t read_count;
 	struct blob_io_ctx *cow_io;
 	TAILQ_HEAD(, blob_io_ctx) pending_ios;
-	TAILQ_ENTRY(cow_sequencer) link;
+};
+
+struct cow_sequencer_list_node {
+	struct cow_sequencer *seq;
+	TAILQ_ENTRY(cow_sequencer_list_node) link;
 };
 
 struct spdk_xattr {
@@ -271,6 +274,7 @@ struct spdk_blob_store {
 	uint64_t			pages_per_slice;
 	uint32_t			valid_slices_mask_start;
 	uint32_t			valid_slices_mask_len;
+	uint64_t			num_md_slices;
 
 	spdk_blob_id			super_blob;
 	struct spdk_bs_type		bstype;
@@ -491,6 +495,7 @@ struct spdk_bs_super_block {
 
 	uint32_t	valid_slice_mask_start; /* Offset from beginning of disk, in pages */
 	uint32_t	valid_slice_mask_len; /* Count, in pages */
+	uint64_t	num_md_slices;
 
 	uint32_t	md_start; /* Offset from beginning of disk, in pages */
 	uint32_t	md_len; /* Count, in pages */
@@ -503,7 +508,7 @@ struct spdk_bs_super_block {
 	uint64_t        size; /* size of blobstore in bytes */
 	uint32_t        io_unit_size; /* Size of io unit in bytes */
 
-	uint8_t         reserved[3988];
+	uint8_t         reserved[3980];
 	uint32_t	crc;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super block size");
@@ -678,10 +683,10 @@ bs_blob_io_unit_to_lba(struct spdk_blob *blob, uint64_t io_unit)
 
 	if (shift != 0) {
 		io_units_per_cluster = io_units_per_page << shift;
-		lba = blob->active.clusters[page >> shift];
+		lba = blob->active.clusters[page >> shift] & (~MAPPING_UNSYNC_BIT);
 	} else {
 		io_units_per_cluster = io_units_per_page * pages_per_cluster;
-		lba = blob->active.clusters[page / pages_per_cluster];
+		lba = blob->active.clusters[page / pages_per_cluster] & (~MAPPING_UNSYNC_BIT);
 	}
 	lba += io_unit % io_units_per_cluster;
 	return lba;
@@ -776,19 +781,4 @@ bs_io_unit_is_allocated(struct spdk_blob *blob, uint64_t io_unit)
 	}
 }
 
-/* Given an cluster into a blobstore, look up the slice into blobstore
- * to beginning of current cluster */
-static inline uint64_t
-bs_cluster_to_slice(struct spdk_blob_store *bs, uint64_t cluster)
-{
-	return bs->slices_per_cluster * cluster;
-}
-
-/* Given an slice into a blobstore, look up the offset into the cluster
- * that the slice located */
-static inline uint32_t
-bs_slice_to_cluster_offset(struct spdk_blob_store *bs, uint64_t slice)
-{
-	return slice % bs->slices_per_cluster;
-}
 #endif

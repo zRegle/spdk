@@ -69,6 +69,12 @@ static int bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map);
 static void blob_handle_subio(struct blob_io_ctx *ctx, int mask);
 static int blob_insert_cluster(struct spdk_blob *blob, uint32_t cluster_num, uint64_t cluster);
+static void bs_release_cluster(struct spdk_blob_store *bs, uint32_t cluster_num);
+static void bs_release_md_page(struct spdk_blob_store *bs, uint32_t page);
+static void blob_prepare_io(struct blob_io_ctx *ctx);
+static inline bool
+blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint64_t length,
+				 uint64_t *lba,	uint32_t *lba_count);
 
 #define SLICES_PER_PAGE (SPDK_BS_PAGE_SIZE * CHAR_BIT)
 #define SLICE_MASK_HEADER (sizeof(struct spdk_bs_md_mask) * CHAR_BIT)
@@ -301,23 +307,45 @@ blob_delete_mapping_sequencer(struct rb_root *root, struct mapping_sequencer *se
 	free(sequencer);
 }
 
+/* Given an cluster into a blobstore, look up the slice into blobstore
+ * to beginning of current cluster */
+static inline uint64_t
+bs_cluster_to_slice(struct spdk_blob_store *bs, uint64_t cluster)
+{
+	return bs->slices_per_cluster * cluster;
+}
+
+/* Given an slice into a blobstore, look up the offset into the cluster
+ * that the slice located */
+static inline uint32_t
+bs_slice_to_cluster_offset(struct spdk_blob_store *bs, uint64_t slice)
+{
+	return slice % bs->slices_per_cluster;
+}
+
+static inline uint64_t
+bs_slice_to_cluster(struct spdk_blob *blob, uint64_t slice)
+{
+	return slice / blob->bs->slices_per_cluster;
+}
+
 static inline uint64_t
 bs_logic_slice_to_lba(struct spdk_blob *blob, uint64_t logic_slice)
 {
-	uint64_t slices_per_cluster;
 	uint64_t cluster;
 	uint64_t lba;
 	uint32_t offset;
 
-	slices_per_cluster = blob->bs->slices_per_cluster;
 	/* get logic cluster */
-	cluster = logic_slice / slices_per_cluster;
+	cluster = bs_slice_to_cluster(blob, logic_slice);
 	/* get slice offset in the cluster */
-	offset = logic_slice % slices_per_cluster;
+	offset = bs_slice_to_cluster_offset(blob->bs, logic_slice);
 	/* block unsync bit, get the lba of the first slice in cluster */
-	lba = blob->active.clusters[cluster] ^ MAPPING_UNSYNC_BIT;
-	/* add offset */
-	lba += offset * (blob->bs->slice_sz / blob->bs->dev->blocklen);
+	lba = blob->active.clusters[cluster] & (~MAPPING_UNSYNC_BIT);
+	if (lba) {
+		/* add offset */
+		lba += offset * (blob->bs->slice_sz / blob->bs->dev->blocklen);
+	}
 
 	return lba;
 }
@@ -381,7 +409,8 @@ blob_get_slice_mask(struct spdk_blob *blob, uint64_t offset, int *mask, bool rea
 	logic_slice = bs_io_unit_to_slice_number(blob, offset);
 	phy_slice = bs_logic_slice_to_physical(blob, logic_slice);
 
-	if (bs_slice_is_valid(blob->bs, phy_slice)) {
+	if (phy_slice >= blob->bs->num_md_slices && 
+		bs_slice_is_valid(blob->bs, phy_slice)) {
 		*mask = SLICE_VALID;
 		return sequencer;
 	}
@@ -443,18 +472,112 @@ blob_io_ctx_init(struct spdk_blob *blob, struct spdk_io_channel *channel,
 	ctx->begin_aligned = ctx->end_aligned = true;
 	ctx->start_slice = bs_io_unit_to_slice_number(blob, offset);
 	ctx->end_slice = bs_io_unit_to_slice_number(blob, offset + length);
+	ctx->split_io_ctx.io_unit_offset = offset;
+	ctx->split_io_ctx.io_units_remaining = length;
 
 	ctx->iovs = calloc(iovcnt, sizeof(struct iovec));
-	if (ctx->iovs) {
+	if (!ctx->iovs) {
 		SPDK_ERRLOG("calloc failed\n");
 		blob_free_io_ctx(ctx);
 		return NULL;
 	}
+	ctx->iovcnt = iovcnt;
 
 	memcpy(ctx->iovs, iovs, iovcnt * sizeof(struct iovec));
 
+	TAILQ_INIT(&ctx->sequencers);
+
 	return ctx;
 }
+
+static void
+blob_insert_cluster_cpl(void *cb_arg, int bserrno)
+{
+	struct blob_io_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+	struct mapping_sequencer *sequencer;
+	struct blob_io_ctx *pending_io = NULL, *tio = NULL;
+	uint64_t cluster_num;
+
+	if (bserrno) {
+		if (bserrno == -EEXIST) {
+			/* The metadata insert failed because another thread
+			 * allocated the cluster first. Free our cluster
+			 * but continue without error. */
+			bserrno = 0;
+		}
+		pthread_mutex_lock(&blob->bs->used_clusters_mutex);
+		bs_release_cluster(blob->bs, ctx->cow_ctx.new_cluster);
+		pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
+		if (ctx->cow_ctx.new_extent_page != 0) {
+			bs_release_md_page(blob->bs, ctx->cow_ctx.new_extent_page);
+		}
+	}
+
+	/* clear unsync bit */
+	cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
+	blob->active.clusters[cluster_num] &= ~MAPPING_UNSYNC_BIT;
+	/* wake up all pending ios */
+	sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
+	assert(sequencer != NULL);
+	TAILQ_FOREACH_FROM_SAFE(pending_io, &sequencer->pending_ios, link, tio) {
+		TAILQ_REMOVE(&sequencer->pending_ios, pending_io, link);
+		blob_prepare_io(pending_io);
+	}
+	blob_delete_mapping_sequencer(&blob->cluster_sequencers_tree, sequencer);
+	
+	ctx->io_complete_cb(ctx->io_complete_cb_arg, bserrno);
+	blob_free_io_ctx(ctx);
+}
+
+static void
+blob_end_io(struct blob_io_ctx *ctx, int bserrno)
+{
+	struct spdk_blob *blob = ctx->blob;
+	struct mapping_sequencer *sequencer;
+	bool is_allocated, mapping_unsync;
+	uint64_t cluster_num;
+
+	if (bserrno != 0) {
+		ctx->io_complete_cb(ctx->io_complete_cb_arg, bserrno);
+		blob_free_io_ctx(ctx);
+		return;
+	}
+
+	cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
+	is_allocated = bs_io_unit_is_allocated(blob, ctx->offset);
+	mapping_unsync = blob->active.clusters[cluster_num] & MAPPING_UNSYNC_BIT;
+
+#ifdef DEBUG
+	/* make sure all slices located in the same cluster */
+	for (uint32_t i = ctx->start_slice + 1; i <= ctx->end_slice; i++) {
+		assert(bs_slice_to_cluster(blob, i) == cluster_num);
+	}
+#endif
+
+	if (!is_allocated || mapping_unsync) {
+		if (ctx->read) {
+			sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
+			assert(sequencer != NULL);
+			sequencer->read_count--;
+			if (sequencer->read_count == 0) {
+				if (mapping_unsync) {
+					assert(sequencer->mapping_io != NULL);
+					blob_prepare_io(sequencer->mapping_io);
+				} else {
+					blob_delete_mapping_sequencer(&blob->cluster_sequencers_tree, sequencer);
+				}
+			}
+		} else {
+			blob_insert_cluster_on_md_thread(ctx->blob, cluster_num, ctx->cow_ctx.new_cluster,
+							ctx->cow_ctx.new_extent_page, blob_insert_cluster_cpl, ctx);
+		}
+	}
+
+	ctx->io_complete_cb(ctx->io_complete_cb_arg, 0);
+	blob_free_io_ctx(ctx);
+}
+
 
 static void
 blob_subio_done(void *arg, int bserrno)
@@ -462,9 +585,10 @@ blob_subio_done(void *arg, int bserrno)
 	struct blob_io_ctx *ctx = arg;
 	
 	assert(ctx->split_io_ctx.oustanding_ops > 0);
+	ctx->split_io_ctx.oustanding_ops--;
 
-	if (!(--ctx->split_io_ctx.oustanding_ops)) {
-		/* TODO: end IO */
+	if (!ctx->split_io_ctx.oustanding_ops) {
+		blob_end_io(ctx, bserrno);
 	}
 }
 
@@ -482,22 +606,25 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 {
 	struct blob_io_ctx *ctx = arg;
 	struct blob_io_ctx *pending_ctx = NULL, *tctx = NULL;
-	struct cow_sequencer *seq = NULL, *tseq = NULL;
+	struct cow_sequencer *seq;
+	struct cow_sequencer_list_node *node = NULL, *tnode = NULL;
 
 	if (bserrno) {
-		/* TODO: end IO, error handle */
+		ctx->io_complete_cb(ctx->io_complete_cb_arg, bserrno);
 		blob_free_io_ctx(ctx);
 		return;
 	}
 
-	TAILQ_FOREACH_FROM_SAFE(seq, &ctx->sequencers, link, tseq) {
+	TAILQ_FOREACH_FROM_SAFE(node, &ctx->sequencers, link, tnode) {
+		seq = node->seq;
 		TAILQ_FOREACH_FROM_SAFE(pending_ctx, &seq->pending_ios, link, tctx) {
 			/* wake up all pending ios */
 			TAILQ_REMOVE(&seq->pending_ios, pending_ctx, link);
 			blob_handle_subio(pending_ctx, SLICE_VALID);
 		}
 		/* destroy sequencer */
-		TAILQ_REMOVE(&ctx->sequencers, seq, link);
+		TAILQ_REMOVE(&ctx->sequencers, node, link);
+		free(node);
 		blob_delete_cow_sequencer(&ctx->blob->slice_sequencers_tree, seq);
 	}
 
@@ -511,6 +638,8 @@ blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 	struct blob_io_ctx *ctx = cb_arg;
 	struct spdk_blob *blob = ctx->blob;
 	struct cow_sequencer *sequencer;
+	struct cow_sequencer_list_node *node;
+	uint64_t phy_slice;
 
 	if (bserrno != 0) {
 		SPDK_ERRLOG("persist valid slices failed, rc %d\n", bserrno);
@@ -519,7 +648,10 @@ blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 	}
 
 	/* memory: set valid_slices */
-	TAILQ_FOREACH(sequencer, &ctx->sequencers, link) {
+	TAILQ_FOREACH(node, &ctx->sequencers, link) {
+		sequencer = node->seq;
+		phy_slice = bs_logic_slice_to_physical(blob, sequencer->slice);
+		assert(phy_slice >= blob->bs->num_md_slices);
 		bs_set_slice(blob->bs, bs_logic_slice_to_physical(blob, sequencer->slice));
 	}
 
@@ -542,6 +674,7 @@ blob_cow_persist_valid_slices(void *arg)
 	/* make sure all slices located in the same page */
 	for (i = ctx->start_slice + 1; i <= ctx->end_slice; i++) {
 		phy_slice = bs_logic_slice_to_physical(blob, i);
+		assert(phy_slice >= blob->bs->num_md_slices);
 		assert(bs_slice_to_md_page(blob->bs, phy_slice) == md_page);
 	}
 #endif
@@ -731,7 +864,7 @@ blob_slice_write_copy(void *cb_arg, int bserrno)
 
 	if (bserrno) {
 		SPDK_ERRLOG("copy on write failed: "
-			"cannot read data from snapshot, rc %d\n");
+			"cannot read data from snapshot, rc %d\n", bserrno);
 		blob_copy_on_write_cpl(ctx, bserrno);
 		return;
 	}
@@ -739,12 +872,13 @@ blob_slice_write_copy(void *cb_arg, int bserrno)
 	rc = blob_io_cow_merge_data(ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("copy on write failed: "
-			"cannot merge data from snapshot, rc %d\n");
+			"cannot merge data from snapshot, rc %d\n", rc);
 		blob_copy_on_write_cpl(ctx, rc);
 		return;
 	}
 
 	lba = bs_logic_slice_to_lba(blob, ctx->start_slice);
+	assert(lba > 0);
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = blob_copy_on_write_cpl;
@@ -842,16 +976,17 @@ static void
 blob_redirect_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct blob_io_ctx *ctx = cb_arg;
-	struct cow_sequencer *sequencer = NULL, *tmp = NULL;
+	struct cow_sequencer *sequencer;
+	struct cow_sequencer_list_node *node = NULL, *tnode = NULL;
 
-	if (!bserrno) {
+	if (bserrno) {
 		SPDK_ERRLOG("redirect read failed, rc %d\n", bserrno);
 		blob_subio_rw_iov_done(seq, ctx, bserrno);
 		return;
 	}
 
-	TAILQ_FOREACH_FROM_SAFE(sequencer, &ctx->sequencers, link, tmp) {
-		TAILQ_REMOVE(&ctx->sequencers, sequencer, link);
+	TAILQ_FOREACH_FROM_SAFE(node, &ctx->sequencers, link, tnode) {
+		sequencer = node->seq;
 		sequencer->read_count--;
 		if (!sequencer->read_count) {
 			if (sequencer->cow_io) {
@@ -860,6 +995,8 @@ blob_redirect_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 				blob_delete_cow_sequencer(&ctx->blob->slice_sequencers_tree, sequencer);
 			}
 		}
+		TAILQ_REMOVE(&ctx->sequencers, node, link);
+		free(node);
 	}
 
 	blob_subio_rw_iov_done(seq, ctx, bserrno);
@@ -870,11 +1007,12 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 {
 	struct spdk_blob *blob = ctx->blob;
 	struct cow_sequencer *seq;
+	struct cow_sequencer_list_node *node;
 	struct spdk_bs_cpl cpl;
-	uint64_t lba, lba_count;
+	uint64_t lba;
+	uint32_t lba_count;
 
-	lba = bs_io_unit_to_back_dev_lba(blob, ctx->offset);
-	lba_count = bs_io_unit_to_back_dev_lba(blob, ctx->length);
+	(void)blob_calculate_lba_and_lba_count(blob, ctx->offset, ctx->length, &lba, &lba_count);
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = ctx->io_complete_cb; /* blob_subio_done */
@@ -899,7 +1037,8 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 	}
 
 	/* set sequencer status */
-	TAILQ_FOREACH(seq, &ctx->sequencers, link) {
+	TAILQ_FOREACH(node, &ctx->sequencers, link) {
+		seq = node->seq;
 		if (seq->cow_io && seq->cow_io != ctx) {
 			assert(mask == SLICE_ACTIVE_IO);
 			TAILQ_INSERT_TAIL(&seq->pending_ios, ctx, link);
@@ -918,16 +1057,16 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 	}
 
 	if (ctx->read) {
-		spdk_bs_sequence_t *seq;
+		spdk_bs_sequence_t *sequence;
 
-		seq = bs_sequence_start(ctx->channel, &cpl);
-		if (!seq) {
+		sequence = bs_sequence_start(ctx->channel, &cpl);
+		if (!sequence) {
 			SPDK_ERRLOG("not enough sequence\n");
-			blob_subio_rw_iov_done(seq, ctx, -ENOMEM);
+			blob_subio_rw_iov_done(sequence, ctx, -ENOMEM);
 			return;
 		}
 
-		bs_sequence_readv_bs_dev(seq, blob->back_bs_dev, ctx->iovs, ctx->iovcnt,
+		bs_sequence_readv_bs_dev(sequence, blob->back_bs_dev, ctx->iovs, ctx->iovcnt,
 						lba, lba_count, blob_redirect_read_cpl, ctx);
 	} else {
 		blob_slice_copy_on_write(ctx);
@@ -941,6 +1080,7 @@ blob_slice_split_io(struct blob_io_ctx *parent, uint64_t sub_offset,
 	struct blob_io_ctx *child;
 	struct spdk_blob *blob = parent->blob;
 	struct iovec *iov, *orig_iov;
+	struct cow_sequencer_list_node *node;
 	size_t orig_iovoff;
 	uint64_t io_units_count;
 	uint64_t byte_count;
@@ -990,7 +1130,15 @@ blob_slice_split_io(struct blob_io_ctx *parent, uint64_t sub_offset,
 
 	for (i = 0; i < SEQUENCER_MAX_COUNT; i++) {
 		if (sequencers_list[i] == NULL) break;
-		TAILQ_INSERT_TAIL(&child->sequencers, sequencers_list[i], link);
+		
+		node = calloc(1, sizeof(*node));
+		if (!node) {
+			SPDK_ERRLOG("calloc failed\n");
+			blob_subio_done(parent, -ENOMEM);
+			return NULL;
+		}
+		node->seq = sequencers_list[i];
+		TAILQ_INSERT_TAIL(&child->sequencers, node, link);
 	}
 
 	parent->split_io_ctx.io_unit_offset += io_units_count;
@@ -1019,6 +1167,7 @@ blob_prepare_io(struct blob_io_ctx *ctx)
 	sub_len = cur_len = 0;
 	main_len = ctx->length;
 	pre_mask = -1, cur_mask = 0;
+	memset(seqs, 0, sizeof(seqs));
 
 	while (main_len > 0) {
 		len_to_boundary = bs_num_io_units_to_slice_boundary(blob, cur_offset);
@@ -1054,7 +1203,7 @@ blob_prepare_io(struct blob_io_ctx *ctx)
 static void
 blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			   struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
-			   spdk_blob_op_complete cb_fn, void *cb_arg, bool read, struct spdk_bs_cpl *cpl)
+			   spdk_blob_op_complete cb_fn, void *cb_arg, bool read)
 {
 	struct blob_io_ctx *ctx;
 	struct mapping_sequencer *sequencer;
@@ -1076,10 +1225,7 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		if (blob->active.clusters[cluster_num] & MAPPING_UNSYNC_BIT) {
 			/* mapping IO unfinished */
 			sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
-			if (sequencer == NULL) {
-				rc = -ENOMEM;
-				goto cleanup;
-			}
+			assert(sequencer != NULL);
 			/* wait untile mapping IO finish */
 			TAILQ_INSERT_TAIL(&sequencer->pending_ios, ctx, link);
 
@@ -1374,9 +1520,6 @@ blob_alloc(struct spdk_blob_store *bs, spdk_blob_id id)
 	TAILQ_INIT(&blob->xattrs_internal);
 	TAILQ_INIT(&blob->pending_persists);
 	TAILQ_INIT(&blob->persists_to_complete);
-
-	RB_EMPTY_ROOT(&blob->cluster_sequencers_tree);
-	RB_EMPTY_ROOT(&blob->slice_sequencers_tree);
 
 	return blob;
 }
@@ -3476,29 +3619,6 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 }
 
 static void
-blob_insert_cluster_cpl(void *cb_arg, int bserrno)
-{
-	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
-
-	if (bserrno) {
-		if (bserrno == -EEXIST) {
-			/* The metadata insert failed because another thread
-			 * allocated the cluster first. Free our cluster
-			 * but continue without error. */
-			bserrno = 0;
-		}
-		pthread_mutex_lock(&ctx->blob->bs->used_clusters_mutex);
-		bs_release_cluster(ctx->blob->bs, ctx->new_cluster);
-		pthread_mutex_unlock(&ctx->blob->bs->used_clusters_mutex);
-		if (ctx->new_extent_page != 0) {
-			bs_release_md_page(ctx->blob->bs, ctx->new_extent_page);
-		}
-	}
-
-	bs_sequence_finish(ctx->seq, bserrno);
-}
-
-static void
 blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
@@ -3904,13 +4024,6 @@ struct rw_iov_ctx {
 };
 
 static void
-rw_iov_done(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
-{
-	assert(cb_arg == NULL);
-	bs_sequence_finish(seq, bserrno);
-}
-
-static void
 rw_iov_split_next(void *cb_arg, int bserrno)
 {
 	struct rw_iov_ctx *ctx = cb_arg;
@@ -4019,10 +4132,6 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 	 *  when the batch was completed, to allow for freeing the memory for the iov arrays.
 	 */
 	if (spdk_likely(length <= bs_num_io_units_to_cluster_boundary(blob, offset))) {
-		uint32_t lba_count;
-		uint64_t lba;
-		bool is_allocated;
-
 		cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 		cpl.u.blob_basic.cb_fn = cb_fn;
 		cpl.u.blob_basic.cb_arg = cb_arg;
@@ -4045,48 +4154,7 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 			return;
 		}
 
-		is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
-
-		if (read) {
-			spdk_bs_sequence_t *seq;
-
-			seq = bs_sequence_start(_channel, &cpl);
-			if (!seq) {
-				cb_fn(cb_arg, -ENOMEM);
-				return;
-			}
-
-			if (is_allocated) {
-				bs_sequence_readv_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
-			} else {
-				bs_sequence_readv_bs_dev(seq, blob->back_bs_dev, iov, iovcnt, lba, lba_count,
-							 rw_iov_done, NULL);
-			}
-		} else {
-			if (is_allocated) {
-				spdk_bs_sequence_t *seq;
-
-				seq = bs_sequence_start(_channel, &cpl);
-				if (!seq) {
-					cb_fn(cb_arg, -ENOMEM);
-					return;
-				}
-
-				bs_sequence_writev_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
-			} else {
-				/* Queue this operation and allocate the cluster */
-				spdk_bs_user_op_t *op;
-
-				op = bs_user_op_alloc(_channel, &cpl, SPDK_BLOB_WRITEV, blob, iov, iovcnt, offset,
-						      length);
-				if (!op) {
-					cb_fn(cb_arg, -ENOMEM);
-					return;
-				}
-
-				bs_allocate_and_copy_cluster(blob, _channel, offset, op);
-			}
-		}
+		blob_start_io(blob, _channel, iov, iovcnt, offset, length, cb_fn, cb_arg, read);
 	} else {
 		struct rw_iov_ctx *ctx;
 
@@ -4945,6 +5013,7 @@ bs_load_valid_slices_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	ctx->bs->valid_slices_mask_start = ctx->super->valid_slice_mask_start;
 	ctx->bs->valid_slices_mask_len = ctx->super->valid_slice_mask_len;
+	ctx->bs->num_md_slices = ctx->super->num_md_slices;
 
 	spdk_free(ctx->mask);
 
@@ -6197,6 +6266,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	for (i = 0; i < num_md_slices; i++) {
 		bs_set_slice(bs, i);
 	}
+	bs->num_md_slices = num_md_slices;
+	ctx->super->num_md_slices = num_md_slices;
 
 	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
 	cpl.u.bs_handle.cb_fn = cb_fn;
@@ -8485,6 +8556,8 @@ blob_insert_cluster_msg(void *arg)
 	struct spdk_blob_insert_cluster_ctx *ctx = arg;
 	uint32_t *extent_page;
 
+	/* temporary clear unsync bit for md synchronization */
+	ctx->blob->active.clusters[ctx->cluster_num] &= ~MAPPING_UNSYNC_BIT;
 	ctx->rc = blob_insert_cluster(ctx->blob, ctx->cluster_num, ctx->cluster);
 	if (ctx->rc != 0) {
 		spdk_thread_send_msg(ctx->thread, blob_insert_cluster_msg_cpl, ctx);
@@ -8520,6 +8593,9 @@ blob_insert_cluster_msg(void *arg)
 		blob_write_extent_page(ctx->blob, *extent_page, ctx->cluster_num,
 				       blob_insert_cluster_msg_cb, ctx);
 	}
+	/* set unsync bit, in case that when md synchronization unfinished,
+	 * a IO arrive, mistakenly takes cluster is allocated and mapping pesisted */
+	ctx->blob->active.clusters[ctx->cluster_num] |= MAPPING_UNSYNC_BIT;
 }
 
 static void
