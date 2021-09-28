@@ -455,12 +455,15 @@ blob_io_ctx_init(struct spdk_blob *blob, struct spdk_io_channel *channel,
 				spdk_blob_op_complete cb_fn, void *cb_arg, bool read)
 {
 	struct blob_io_ctx *ctx;
+	uint64_t io_unit_per_slice;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
 		SPDK_ERRLOG("calloc failed\n");
 		return NULL;
 	}
+
+	io_unit_per_slice = bs_io_unit_per_page(blob->bs) * blob->bs->pages_per_slice;
 
 	ctx->blob = blob;
 	ctx->channel = channel;
@@ -472,6 +475,19 @@ blob_io_ctx_init(struct spdk_blob *blob, struct spdk_io_channel *channel,
 	ctx->begin_aligned = ctx->end_aligned = true;
 	ctx->start_slice = bs_io_unit_to_slice_number(blob, offset);
 	ctx->end_slice = bs_io_unit_to_slice_number(blob, offset + length);
+	if ((offset + length) % io_unit_per_slice == 0) {
+		/* let 'offset + length' = END, when END aligned with slice sz
+		 * 'ctx->end_slice' will mistakenly plus one
+		 *
+		 * for example: 
+		 *  cluster sz: 16M, slice sz: 64k, offset: 32640, length: 128
+		 *  'ctx->start_slice': 255, 'ctx->end_slice': 256
+		 * however, the IO range only cover slice 255, does not overlap with slice 256
+		 * 
+		 * hence, we need to correct 'ctx->end_slice' in this case */
+		assert(ctx->end_slice > 0);
+		ctx->end_slice--;
+	}
 	ctx->split_io_ctx.io_unit_offset = offset;
 	ctx->split_io_ctx.io_units_remaining = length;
 
@@ -682,7 +698,7 @@ blob_cow_persist_valid_slices(void *arg)
 	/* persist valid_slices */
 	blob_serialize_slice_page(blob, phy_slice, ctx->cow_ctx.mask_payload);
 	bs_sequence_write_dev(ctx->cow_ctx.seq, ctx->cow_ctx.mask_payload, 
-					bs_md_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + md_page),
+					bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + md_page),
 					bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
 					blob_cow_persist_valid_slices_cb, ctx);
 }
@@ -3394,7 +3410,7 @@ blob_persist_write_valid_slices(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 			}
 			blob_serialize_slice_page(blob, prev_slice, ctx->valid_slices_payload);
 			bs_sequence_write_dev(seq, ctx->valid_slices_payload, 
-							bs_md_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + prev_md_page),
+							bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + prev_md_page),
 							bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
 							blob_persist_write_valid_slices, ctx);
 			return;
@@ -5350,6 +5366,55 @@ static void
 bs_load_replay_cur_md_page(struct spdk_bs_load_ctx *ctx);
 
 static void
+bs_recovery_load_valid_slices_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx	*ctx = cb_arg;
+
+	if (bserrno != 0) {
+		bs_load_ctx_fail(ctx, bserrno);
+		return;
+	}
+
+	/* The type must be correct */
+	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_VALID_SLICES);
+	/* The length of the mask (in bits) must not be greater than the length of the buffer (converted to bits) */
+	assert(ctx->mask->length <= (ctx->super->valid_slice_mask_len * sizeof(
+					     struct spdk_blob_md_page) * 8));
+	/* The length of the mask must be exactly equal to the total number of clusters */
+	assert(ctx->mask->length == ctx->bs->total_slices);
+
+	spdk_bit_array_load_mask(ctx->bs->valid_slices, ctx->mask->mask);
+	ctx->bs->num_valid_slices = spdk_bit_array_count_set(ctx->bs->valid_slices);
+	assert(ctx->bs->num_valid_slices <= ctx->bs->total_slices);
+
+	ctx->bs->valid_slices_mask_start = ctx->super->valid_slice_mask_start;
+	ctx->bs->valid_slices_mask_len = ctx->super->valid_slice_mask_len;
+	ctx->bs->num_md_slices = ctx->super->num_md_slices;
+
+	bs_load_complete(ctx);
+}
+
+static void
+bs_recovery_load_valid_slices(spdk_bs_sequence_t *seq, void *cb_arg)
+{
+	struct spdk_bs_load_ctx	*ctx = cb_arg;
+	uint64_t		lba, lba_count, mask_size;
+
+	/* Read the valid slices mask */
+	mask_size = ctx->super->valid_slice_mask_len * SPDK_BS_PAGE_SIZE;
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				 SPDK_MALLOC_DMA);
+	if (!ctx->mask) {
+		bs_load_ctx_fail(ctx, -ENOMEM);
+		return;
+	}
+	lba = bs_page_to_lba(ctx->bs, ctx->super->valid_slice_mask_start);
+	lba_count = bs_page_to_lba(ctx->bs, ctx->super->valid_slice_mask_len);
+	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
+			     bs_recovery_load_valid_slices_cpl, ctx);
+}
+
+static void
 bs_load_write_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
@@ -5359,7 +5424,7 @@ bs_load_write_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		return;
 	}
 
-	bs_load_complete(ctx);
+	bs_recovery_load_valid_slices(seq, ctx);
 }
 
 static void
@@ -5583,6 +5648,12 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 	}
 
 	rc = spdk_bit_array_resize(&ctx->bs->open_blobids, ctx->super->md_len);
+	if (rc < 0) {
+		bs_load_ctx_fail(ctx, -ENOMEM);
+		return;
+	}
+
+	rc = spdk_bit_array_resize(&ctx->bs->valid_slices, ctx->bs->total_slices);
 	if (rc < 0) {
 		bs_load_ctx_fail(ctx, -ENOMEM);
 		return;
