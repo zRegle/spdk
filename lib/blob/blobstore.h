@@ -77,6 +77,7 @@ struct blob_io_ctx {
 		uint64_t io_unit_offset;
 		uint64_t io_units_remaining;
 		uint64_t io_units_split;
+		int err;
 	} split_io_ctx;
 	struct {
 		struct spdk_thread *thread;
