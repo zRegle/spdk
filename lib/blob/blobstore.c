@@ -91,8 +91,11 @@ static void
 bs_set_slice(struct spdk_blob_store *bs, uint64_t slice)
 {
 	assert(slice < spdk_bit_array_capacity(bs->valid_slices));
-	assert(spdk_bit_array_get(bs->valid_slices, slice) == false);
 	assert(bs->num_valid_slices < bs->total_slices);
+
+	if (spdk_bit_array_get(bs->valid_slices, slice) == true) {
+		return;
+	}
 
 	assert(spdk_bit_array_set(bs->valid_slices, slice) == 0);
 	bs->num_valid_slices++;
@@ -102,8 +105,11 @@ static void
 bs_clear_slice(struct spdk_blob_store *bs, uint64_t slice)
 {
 	assert(slice < spdk_bit_array_capacity(bs->valid_slices));
-	assert(spdk_bit_array_get(bs->valid_slices, slice) == true);
 	assert(bs->num_valid_slices > 0);
+
+	if (spdk_bit_array_get(bs->valid_slices, slice) == false) {
+		return;
+	}
 
 	spdk_bit_array_clear(bs->valid_slices, slice);
 	bs->num_valid_slices--;
@@ -237,10 +243,10 @@ blob_get_cow_sequencer(struct rb_root *root, uint64_t slice)
 	while (*node) {
 		this = container_of(*node, struct cow_sequencer, node);
 		parent = *node;
-		if (this->slice > this->slice)
+		if (this->slice > slice)
 			node = &((*node)->rb_left);
-		else if (this->slice < this->slice)
-			node = &((*node)->rb_left);
+		else if (this->slice < slice)
+			node = &((*node)->rb_right);
 		else
 			return this;
 	}
@@ -279,10 +285,10 @@ blob_get_mapping_sequencer(struct rb_root *root, uint64_t cluster)
 	while (*node) {
 		this = container_of(*node, struct mapping_sequencer, node);
 		parent = *node;
-		if (this->cluster > this->cluster)
+		if (this->cluster > cluster)
 			node = &((*node)->rb_left);
-		else if (this->cluster < this->cluster)
-			node = &((*node)->rb_left);
+		else if (this->cluster < cluster)
+			node = &((*node)->rb_right);
 		else
 			return this;
 	}
@@ -688,6 +694,7 @@ blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 		sequencer = node->seq;
 		phy_slice = bs_logic_slice_to_physical(blob, sequencer->slice);
 		assert(phy_slice >= blob->bs->num_md_slices);
+		assert(spdk_bit_array_get(blob->bs->valid_slices, phy_slice) == false);
 		bs_set_slice(blob->bs, phy_slice);
 	}
 
@@ -1217,7 +1224,7 @@ blob_prepare_io(struct blob_io_ctx *ctx)
 		cur_len = spdk_min(len_to_boundary, main_len);
 		main_len -= cur_len;
 
-		cur_sequencer = blob_get_slice_mask(blob, sub_offset, &cur_mask, ctx->read);
+		cur_sequencer = blob_get_slice_mask(blob, cur_offset, &cur_mask, ctx->read);
 		if (cur_mask == ERROR) {
 			goto error;
 		}
@@ -1466,10 +1473,15 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 		if (blob->use_extent_table && *extent_page == 0) {
 			*extent_page = *lowest_free_md_page;
 		}
-		start_slice = bs_cluster_to_slice(blob->bs, *cluster);
-		for (offset = 0; offset < blob->bs->slices_per_cluster; offset++) {
-			slice = start_slice + offset;
+	}
+
+	start_slice = bs_cluster_to_slice(blob->bs, *cluster);
+	for (offset = 0; offset < blob->bs->slices_per_cluster; offset++) {
+		slice = start_slice + offset;
+		if (update_map) {
 			bs_set_slice(blob->bs, slice);
+		} else {
+			bs_clear_slice(blob->bs, slice);
 		}
 	}
 
