@@ -163,7 +163,9 @@ blob_serialize_slice_page(const struct spdk_blob *blob,
 		memcpy(mask->mask, bs->valid_slices->words, first_page_data_bytes);
 	} else {
 		bias = (md_page - 1) * SPDK_BS_PAGE_SIZE + first_page_data_bytes;
-		memcpy(payload, bs->valid_slices->words + bias, SPDK_BS_PAGE_SIZE);
+		/* 'bias' is measured in bytes, 'bs->valid_slices->words' is uint64_t
+		 * convert it first */
+		memcpy(payload, (uint8_t*)bs->valid_slices->words + bias, SPDK_BS_PAGE_SIZE);
 	}
 }
 
@@ -891,6 +893,7 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 #ifdef DEBUG
 		/* iov[m] may be iov[0], in this case, iov[0]->iov_len == slice_sz */
 		if (ctx->iovcnt == 1) {
+			/* TODO: mkfs assert failed, check why */
 			assert(ctx->iovs[0].iov_len == blob->bs->slice_sz);
 		}
 #endif
@@ -3459,8 +3462,17 @@ blob_persist_write_valid_slices(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		if (lba == 0) continue;
 		cur_slice = bs_lba_to_slice(blob->bs, lba);
 		cur_md_page = bs_slice_to_md_page(blob->bs, cur_slice);
-		if (prev_md_page != UINT32_MAX && prev_md_page != cur_md_page) {
-			ctx->cluster_idx = i;
+		if ((prev_md_page != UINT32_MAX && prev_md_page != cur_md_page) || 
+			i == blob->active.num_clusters - 1) {
+			/**
+			 * persist valid_slices md page under any of these conditions:
+			 *  1.cur_slice and pre_slice located in different bitmap pages
+			 *  2.the last bitmap page 
+			 *
+			 * if it is the last slice, set ctx->cluster_idx to num_clusters
+			 * to prevent endless write
+			 */
+			ctx->cluster_idx = i == blob->active.num_clusters - 1 ? blob->active.num_clusters : i;
 			ctx->valid_slices_payload = spdk_malloc(SPDK_BS_PAGE_SIZE, 0,
 				     		NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 			if (ctx->valid_slices_payload == NULL) {
