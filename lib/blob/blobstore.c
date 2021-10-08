@@ -78,6 +78,8 @@ blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint6
 
 #define SLICES_PER_PAGE (SPDK_BS_PAGE_SIZE * CHAR_BIT)
 #define SLICE_MASK_HEADER (sizeof(struct spdk_bs_md_mask) * CHAR_BIT)
+#define BWRAID_VOLUME_MIN_SIZE (1ULL << 30)
+#define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
 
 enum slice_status {
 	ERROR = -2,
@@ -3363,7 +3365,7 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 		pthread_mutex_lock(&blob->bs->used_clusters_mutex);
 		for (i = num_clusters; i < sz; i++) {
 			bs_allocate_cluster(blob, i, &cluster, &lfmd, true);
-			lfmd++;
+			// lfmd++;
 		}
 		pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
 	}
@@ -6211,6 +6213,20 @@ bs_init_trim_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			      bs_init_persist_super_cpl, ctx);
 }
 
+static inline uint32_t
+bwraid_bs_calc_md_page(struct spdk_blob_store *bs, struct spdk_bs_dev *dev)
+{
+    uint64_t cluster_num;
+    uint32_t volume_cnt, extent_page_num, md_page_num;
+
+    cluster_num = dev->blockcnt * dev->blocklen / bs->cluster_sz;
+    volume_cnt = 2 * dev->blockcnt * dev->blocklen / BWRAID_VOLUME_MIN_SIZE;
+    extent_page_num = spdk_divide_round_up(cluster_num, SPDK_EXTENTS_PER_EP);
+    md_page_num = 2 * volume_cnt + spdk_divide_round_up(extent_page_num, BWRAID_EXTENT_ENTRY_PER_PAGE);
+
+    return md_page_num + extent_page_num;
+}
+
 void
 spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
@@ -6265,7 +6281,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		 * of usable clusters. This can be addressed with
 		 * more complex math in the future.
 		 */
-		bs->md_len = bs->total_clusters;
+		bs->md_len = bwraid_bs_calc_md_page(bs, dev);
 	} else {
 		bs->md_len = opts.num_md_pages;
 	}
