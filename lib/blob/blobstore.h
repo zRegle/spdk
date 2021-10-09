@@ -92,6 +92,7 @@ struct blob_io_ctx {
 	uint64_t end_slice;
 	bool begin_aligned;
 	bool end_aligned;
+	long sleep_time;
 };
 
 struct mapping_sequencer {
@@ -239,6 +240,8 @@ struct spdk_blob {
 
 	struct rb_root cluster_sequencers_tree;
 	struct rb_root slice_sequencers_tree;
+
+	struct cow_sequencer *sequncers;
 };
 
 struct spdk_blob_store {
