@@ -92,6 +92,7 @@ struct blob_io_ctx {
 	uint64_t end_slice;
 	bool begin_aligned;
 	bool end_aligned;
+	uint64_t sleep_time;
 };
 
 struct mapping_sequencer {

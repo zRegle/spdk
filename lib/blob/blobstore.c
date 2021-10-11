@@ -90,6 +90,23 @@ enum slice_status {
 };
 
 static void
+blob_io_ctx_statistics(struct blob_io_ctx *ctx, bool end)
+{
+	long ms;
+	struct timespec spec;
+
+	clock_gettime(CLOCK_REALTIME, &spec);
+
+	if (end == true) {
+		ms = round((spec.tv_nsec - ctx->sleep_time) / 1.0e6);
+		/* TODO: negative number, why? */
+		ctx->sleep_time = ms;
+	} else {
+		ctx->sleep_time = spec.tv_nsec;
+	}
+}
+
+static void
 bs_set_slice(struct spdk_blob_store *bs, uint64_t slice)
 {
 	assert(slice < spdk_bit_array_capacity(bs->valid_slices));
@@ -564,6 +581,10 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 	sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
 	assert(sequencer != NULL);
 	TAILQ_FOREACH_FROM_SAFE(pending_io, &sequencer->pending_ios, link, tio) {
+		blob_io_ctx_statistics(pending_io, true);
+		SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
+				pending_io, pending_io->offset, 
+				pending_io->length, pending_io->sleep_time);
 		TAILQ_REMOVE(&sequencer->pending_ios, pending_io, link);
 		blob_prepare_io(pending_io);
 	}
@@ -606,6 +627,10 @@ blob_end_io(struct blob_io_ctx *ctx, int bserrno)
 			if (sequencer->read_count == 0) {
 				if (mapping_unsync) {
 					assert(sequencer->mapping_io != NULL);
+					blob_io_ctx_statistics(sequencer->mapping_io, true);
+					SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
+							sequencer->mapping_io, sequencer->mapping_io->offset, 
+							sequencer->mapping_io->length, sequencer->mapping_io->sleep_time);
 					blob_prepare_io(sequencer->mapping_io);
 				} else {
 					blob_delete_mapping_sequencer(&blob->cluster_sequencers_tree, sequencer);
@@ -667,6 +692,10 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 		seq = node->seq;
 		TAILQ_FOREACH_FROM_SAFE(pending_ctx, &seq->pending_ios, link, tctx) {
 			/* wake up all pending ios */
+			blob_io_ctx_statistics(pending_ctx, true);
+			SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
+					pending_ctx, pending_ctx->offset, 
+					pending_ctx->length, pending_ctx->sleep_time);
 			TAILQ_REMOVE(&seq->pending_ios, pending_ctx, link);
 			blob_handle_subio(pending_ctx, VALID);
 		}
@@ -1043,6 +1072,10 @@ blob_redirect_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		sequencer->read_count--;
 		if (!sequencer->read_count) {
 			if (sequencer->cow_io) {
+				blob_io_ctx_statistics(sequencer->cow_io, true);
+				SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
+						sequencer->cow_io, sequencer->cow_io->offset, 
+						sequencer->cow_io->length, sequencer->cow_io->sleep_time);
 				blob_handle_subio(sequencer->cow_io, INVALID);
 			} else {
 				blob_delete_cow_sequencer(&ctx->blob->slice_sequencers_tree, sequencer);
@@ -1098,6 +1131,9 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 		if (seq->cow_io && seq->cow_io != ctx) {
 			assert(mask == ACTIVE_IO);
 			TAILQ_INSERT_TAIL(&seq->pending_ios, ctx, link);
+			blob_io_ctx_statistics(ctx, false);
+			SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait slice cow\n",
+					ctx, ctx->offset, ctx->length);
 			return;
 		}
 		if (ctx->read) {
@@ -1106,7 +1142,10 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 			seq->cow_io = ctx;
 			if (seq->read_count > 0) {
 				assert(mask == ACTIVE_IO);
-				TAILQ_INSERT_TAIL(&seq->pending_ios, ctx, link);
+				assert(TAILQ_EMPTY(&seq->pending_ios));
+				blob_io_ctx_statistics(ctx, false);
+				SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait slice read\n",
+						ctx, ctx->offset, ctx->length);
 				return;
 			}
 		}
@@ -1303,7 +1342,9 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			assert(sequencer != NULL);
 			/* wait untile mapping IO finish */
 			TAILQ_INSERT_TAIL(&sequencer->pending_ios, ctx, link);
-
+			blob_io_ctx_statistics(ctx, false);
+			SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait cluster cow\n",
+					ctx, ctx->offset, ctx->length);
 			return;
 		} else {
 			blob_prepare_io(ctx);
@@ -1338,7 +1379,9 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 				assert(TAILQ_EMPTY(&sequencer->pending_ios));
 				/* wait untile active read finish */
 				sequencer->mapping_io = ctx;
-
+				blob_io_ctx_statistics(ctx, false);
+				SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait cluster read\n",
+						ctx, ctx->offset, ctx->length);
 				return;
 			}
 		}
@@ -9300,3 +9343,4 @@ spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blob)
+SPDK_LOG_REGISTER_COMPONENT(io)
