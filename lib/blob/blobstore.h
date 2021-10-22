@@ -66,25 +66,38 @@ struct blob_io_ctx {
 	uint64_t offset;
 	uint64_t length;
 	bool read;
+	/* IO buffer data */
 	int iovcnt;
 	struct iovec *iovs;
+	/* IO finish callback */
 	spdk_blob_op_complete io_complete_cb;
 	void *io_complete_cb_arg;
+
+	/* link for pending_io insertion */
 	TAILQ_ENTRY(blob_io_ctx) link;
+	/* all the sequencer that this IO related */
 	TAILQ_HEAD(, cow_sequencer_list_node) sequencers;
 	struct {
+		/* how many subios are active */
 		uint32_t oustanding_ops;
+		/* the next subio starts */
 		uint64_t io_unit_offset;
+		/* length that is not splited */
 		uint64_t io_units_remaining;
+		/* length that is splited */
 		uint64_t io_units_split;
 		int err;
 	} split_io_ctx;
 	struct {
+		/* the thread that hanlde IO */
 		struct spdk_thread *thread;
+		/* new allocated md */
 		uint64_t new_cluster;
 		uint32_t new_extent_page;
+		/* two buffer for data merge */
 		void *payload[2];
 		spdk_bs_sequence_t *seq;
+		/* valid_slices buffer */
 		void *mask_payload;
 		bool need_merge_data;
 	} cow_ctx;
@@ -92,7 +105,17 @@ struct blob_io_ctx {
 	uint64_t end_slice;
 	bool begin_aligned;
 	bool end_aligned;
-	uint64_t sleep_time;
+#ifdef DEBUG
+	struct {
+		struct timespec ts;
+		/* time of read data from snapshot */
+		float read;
+		/* time of write data to volume */
+		float write;
+		/* time of persist metadata */
+		float md;
+	} statistics;
+#endif
 };
 
 struct mapping_sequencer {

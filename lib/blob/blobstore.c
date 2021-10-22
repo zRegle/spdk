@@ -89,22 +89,23 @@ enum slice_status {
 	ACTIVE_IO,
 };
 
-static void
-blob_io_ctx_statistics(struct blob_io_ctx *ctx, bool end)
+#ifdef DEBUG
+static float
+blob_io_ctx_statistics(struct blob_io_ctx *ctx, bool is_end)
 {
-	long ms;
-	struct timespec spec;
+	struct timespec *start = &ctx->statistics.ts, end;
 
-	clock_gettime(CLOCK_REALTIME, &spec);
-
-	if (end == true) {
-		ms = round((spec.tv_nsec - ctx->sleep_time) / 1.0e6);
-		/* TODO: negative number, why? */
-		ctx->sleep_time = ms;
+	if (is_end) {
+		clock_gettime(CLOCK_REALTIME, &end);
+		float elapsed = (end.tv_sec - start->tv_sec) * 1.0e3 + 
+						(end.tv_nsec - start->tv_nsec) / 1.0e6;
+		return elapsed;
 	} else {
-		ctx->sleep_time = spec.tv_nsec;
+		clock_gettime(CLOCK_REALTIME, start);
+		return 0.0f;
 	}
 }
+#endif
 
 static void
 bs_set_slice(struct spdk_blob_store *bs, uint64_t slice)
@@ -581,10 +582,6 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 	sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
 	assert(sequencer != NULL);
 	TAILQ_FOREACH_FROM_SAFE(pending_io, &sequencer->pending_ios, link, tio) {
-		blob_io_ctx_statistics(pending_io, true);
-		SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
-				pending_io, pending_io->offset, 
-				pending_io->length, pending_io->sleep_time);
 		TAILQ_REMOVE(&sequencer->pending_ios, pending_io, link);
 		blob_prepare_io(pending_io);
 	}
@@ -627,10 +624,6 @@ blob_end_io(struct blob_io_ctx *ctx, int bserrno)
 			if (sequencer->read_count == 0) {
 				if (mapping_unsync) {
 					assert(sequencer->mapping_io != NULL);
-					blob_io_ctx_statistics(sequencer->mapping_io, true);
-					SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
-							sequencer->mapping_io, sequencer->mapping_io->offset, 
-							sequencer->mapping_io->length, sequencer->mapping_io->sleep_time);
 					blob_prepare_io(sequencer->mapping_io);
 				} else {
 					blob_delete_mapping_sequencer(&blob->cluster_sequencers_tree, sequencer);
@@ -688,14 +681,17 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 		return;
 	}
 
+#ifdef DEBUG
+	float total = ctx->statistics.read + ctx->statistics.write + ctx->statistics.md;
+	printf("offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
+			ctx->offset, ctx->length, TAILQ_FIRST(&ctx->sequencers)->seq->slice,
+			ctx->statistics.read, ctx->statistics.write, ctx->statistics.md, total);
+#endif
+
 	TAILQ_FOREACH_FROM_SAFE(node, &ctx->sequencers, link, tnode) {
 		seq = node->seq;
 		TAILQ_FOREACH_FROM_SAFE(pending_ctx, &seq->pending_ios, link, tctx) {
 			/* wake up all pending ios */
-			blob_io_ctx_statistics(pending_ctx, true);
-			SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
-					pending_ctx, pending_ctx->offset, 
-					pending_ctx->length, pending_ctx->sleep_time);
 			TAILQ_REMOVE(&seq->pending_ios, pending_ctx, link);
 			blob_handle_subio(pending_ctx, VALID);
 		}
@@ -721,6 +717,10 @@ blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 		bs_sequence_finish(seq, bserrno);
 		return;
 	}
+
+#ifdef DEBUG
+	ctx->statistics.md = blob_io_ctx_statistics(ctx, true);
+#endif
 
 	/* memory: set valid_slices */
 	TAILQ_FOREACH(node, &ctx->sequencers, link) {
@@ -753,6 +753,8 @@ blob_cow_persist_valid_slices(void *arg)
 		assert(phy_slice >= blob->bs->num_md_slices);
 		assert(bs_slice_to_md_page(blob->bs, phy_slice) == md_page);
 	}
+
+	blob_io_ctx_statistics(ctx, false);
 #endif
 
 	/* persist valid_slices */
@@ -775,6 +777,10 @@ blob_slice_write_copy_cpl(spdk_bs_sequence_t *sequence, void *cb_arg, int bserrn
 		bs_sequence_finish(sequence, bserrno);
 		return;
 	}
+
+#ifdef DEBUG
+	ctx->statistics.write = blob_io_ctx_statistics(ctx, true);
+#endif
 
 	playload = spdk_malloc(SPDK_BS_PAGE_SIZE, 0, NULL, 
 					SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
@@ -954,6 +960,10 @@ blob_slice_write_copy(void *cb_arg, int bserrno)
 		return;
 	}
 
+#ifdef DEBUG
+	ctx->statistics.read = blob_io_ctx_statistics(ctx, true);
+#endif
+
 	rc = blob_io_cow_merge_data(ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("copy on write failed: "
@@ -975,6 +985,10 @@ blob_slice_write_copy(void *cb_arg, int bserrno)
 		blob_copy_on_write_cpl(ctx, -ENOMEM);
 		return;
 	}
+
+#ifdef DEBUG
+	blob_io_ctx_statistics(ctx, false);
+#endif
 
 	bs_sequence_writev_dev(ctx->cow_ctx.seq, ctx->iovs, ctx->iovcnt, lba, ctx->length, 
 					blob_slice_write_copy_cpl, ctx);
@@ -1072,10 +1086,6 @@ blob_redirect_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		sequencer->read_count--;
 		if (!sequencer->read_count) {
 			if (sequencer->cow_io) {
-				blob_io_ctx_statistics(sequencer->cow_io, true);
-				SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, sleep time %ld\n",
-						sequencer->cow_io, sequencer->cow_io->offset, 
-						sequencer->cow_io->length, sequencer->cow_io->sleep_time);
 				blob_handle_subio(sequencer->cow_io, INVALID);
 			} else {
 				blob_delete_cow_sequencer(&ctx->blob->slice_sequencers_tree, sequencer);
@@ -1131,9 +1141,6 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 		if (seq->cow_io && seq->cow_io != ctx) {
 			assert(mask == ACTIVE_IO);
 			TAILQ_INSERT_TAIL(&seq->pending_ios, ctx, link);
-			blob_io_ctx_statistics(ctx, false);
-			SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait slice cow\n",
-					ctx, ctx->offset, ctx->length);
 			return;
 		}
 		if (ctx->read) {
@@ -1143,9 +1150,6 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 			if (seq->read_count > 0) {
 				assert(mask == ACTIVE_IO);
 				assert(TAILQ_EMPTY(&seq->pending_ios));
-				blob_io_ctx_statistics(ctx, false);
-				SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait slice read\n",
-						ctx, ctx->offset, ctx->length);
 				return;
 			}
 		}
@@ -1164,6 +1168,9 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 		bs_sequence_readv_bs_dev(sequence, blob->back_bs_dev, ctx->iovs, ctx->iovcnt,
 						lba, lba_count, blob_redirect_read_cpl, ctx);
 	} else {
+#ifdef DEBUG
+		blob_io_ctx_statistics(ctx, false);
+#endif
 		blob_slice_copy_on_write(ctx);
 	}
 }
@@ -1342,9 +1349,6 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			assert(sequencer != NULL);
 			/* wait untile mapping IO finish */
 			TAILQ_INSERT_TAIL(&sequencer->pending_ios, ctx, link);
-			blob_io_ctx_statistics(ctx, false);
-			SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait cluster cow\n",
-					ctx, ctx->offset, ctx->length);
 			return;
 		} else {
 			blob_prepare_io(ctx);
@@ -1374,14 +1378,10 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 
 			if (sequencer->read_count > 0) {
 				/* active read unfinished, should wait */
-
 				/* pending list must be empty */
 				assert(TAILQ_EMPTY(&sequencer->pending_ios));
 				/* wait untile active read finish */
 				sequencer->mapping_io = ctx;
-				blob_io_ctx_statistics(ctx, false);
-				SPDK_DEBUGLOG(io, "ctx %p, offset %ld, length %ld, wait cluster read\n",
-						ctx, ctx->offset, ctx->length);
 				return;
 			}
 		}
