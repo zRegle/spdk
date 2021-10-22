@@ -3,6 +3,12 @@
 SCRIPTS=$(cd `dirname $0`;pwd)
 RPC=$SCRIPTS/rpc.py
 
+if [ $# -lt 1 ];
+then
+    echo "missing cluster sz"
+    exit 1
+fi
+
 input=$1
 unit=${input#${input%?}}
 num=${input%${unit}}
@@ -25,7 +31,18 @@ esac
 
 size=$(( $num * $factor ))
 
-$RPC bdev_aio_create /dev/sdi aio0
+if [ $# -eq 2 ];
+then
+    device=$2
+else
+    device="/dev/mapper/dm0"
+fi
+
+$RPC iscsi_set_options -s 65536
+$RPC framework_start_init
+$RPC framework_wait_init
+
+$RPC bdev_aio_create $device aio0
 $RPC bdev_lvol_create_lvstore aio0 lvs0 -c $size
 $RPC bdev_lvol_create -l lvs0 l0 102400
 $RPC bdev_lvol_snapshot lvs0/l0 sp0

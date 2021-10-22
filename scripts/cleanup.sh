@@ -10,8 +10,14 @@ $SCRIPTS/setup.sh reset &> /dev/null
 iscsiadm -m node --logout &> /dev/null
 iscsiadm -m node -o delete &> /dev/null
 
-if [ $# -eq 1 ]
+if [ $# -gt 0 ]
 then
-    dd if=/dev/zero of=/dev/sdi bs=1M count=16 &> /dev/null
+    if [ $# -eq 2 ]
+    then
+        device=$2
+    else
+        device="/dev/mapper/dm0"
+    fi
+    dd if=/dev/zero of=$device bs=1M count=64 &> /dev/null
     echo 'clear md'
 fi
