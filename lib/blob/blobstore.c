@@ -117,7 +117,12 @@ bs_set_slice(struct spdk_blob_store *bs, uint64_t slice)
 		return;
 	}
 
+#ifdef DEBUG
 	assert(spdk_bit_array_set(bs->valid_slices, slice) == 0);
+#else
+	spdk_bit_array_set(bs->valid_slices, slice);
+#endif
+
 	bs->num_valid_slices++;
 }
 
@@ -741,14 +746,13 @@ blob_cow_persist_valid_slices(void *arg)
 	struct spdk_blob *blob = ctx->blob;
 	uint64_t phy_slice;
 	uint32_t md_page;
-	uint32_t i;
 
 	phy_slice = bs_logic_slice_to_physical(blob, ctx->start_slice);
 	md_page = bs_slice_to_md_page(blob->bs, phy_slice);
 
 #ifdef DEBUG
 	/* make sure all slices located in the same page */
-	for (i = ctx->start_slice + 1; i <= ctx->end_slice; i++) {
+	for (uint32_t i = ctx->start_slice + 1; i <= ctx->end_slice; i++) {
 		phy_slice = bs_logic_slice_to_physical(blob, i);
 		assert(phy_slice >= blob->bs->num_md_slices);
 		assert(bs_slice_to_md_page(blob->bs, phy_slice) == md_page);
@@ -1367,20 +1371,21 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			pthread_mutex_lock(&blob->bs->used_clusters_mutex);
 			rc = bs_allocate_cluster(blob, cluster_num, &ctx->cow_ctx.new_cluster, 
 							&ctx->cow_ctx.new_extent_page, false);
-			pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
 			if (rc < 0) {
 				SPDK_ERRLOG("allocate cluster failed\n");
+				pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
 				goto cleanup;
 			}
 			/* set mapping unsync */
 			blob_insert_cluster(blob, cluster_num, ctx->cow_ctx.new_cluster);
 			blob->active.clusters[cluster_num] |= MAPPING_UNSYNC_BIT;
+			pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
 
 			if (sequencer->read_count > 0) {
 				/* active read unfinished, should wait */
 				/* pending list must be empty */
 				assert(TAILQ_EMPTY(&sequencer->pending_ios));
-				/* wait untile active read finish */
+				/* wait until active read finish */
 				sequencer->mapping_io = ctx;
 				return;
 			}
