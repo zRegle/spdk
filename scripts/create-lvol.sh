@@ -31,26 +31,19 @@ esac
 
 size=$(( $num * $factor ))
 
-if [ $# -eq 2 ];
-then
-    device=$2
-else
-    device="/dev/mapper/dm0"
-fi
-
 $RPC iscsi_set_options -s 65536
 $RPC framework_start_init
 $RPC framework_wait_init
 
-$RPC bdev_aio_create $device aio0
-$RPC bdev_lvol_create_lvstore aio0 lvs0 -c $size
+$RPC bdev_nvme_attach_controller -b NVMe1 -t PCIe -a 0000:02:00.0
+$RPC bdev_lvol_create_lvstore NVMe1n1 lvs0 -c $size
 $RPC bdev_lvol_create -l lvs0 l0 102400
 $RPC bdev_lvol_snapshot lvs0/l0 sp0
 $RPC bdev_lvol_clone lvs0/sp0 clone0
 
 $RPC iscsi_create_portal_group 1 127.0.0.1:3260
 $RPC iscsi_create_initiator_group 2 ANY 127.0.0.1/32
-$RPC iscsi_create_target_node d0 d0a lvs0/l0:0 1:2 1024 -d
+$RPC iscsi_create_target_node d0 d0a lvs0/l0:0 1:2 64 -d
 
 iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3260
 iscsiadm -m node --login
