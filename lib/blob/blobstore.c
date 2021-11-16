@@ -563,7 +563,7 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 	struct spdk_blob *blob = ctx->blob;
 	struct mapping_sequencer *sequencer;
 	struct blob_io_ctx *pending_io = NULL, *tio = NULL;
-	uint64_t cluster_num;
+	uint64_t cluster_num, *lba;
 
 	if (bserrno) {
 		if (bserrno == -EEXIST) {
@@ -582,7 +582,9 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 
 	/* clear unsync bit */
 	cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
-	blob->active.clusters[cluster_num] &= ~MAPPING_UNSYNC_BIT;
+	lba = &blob->active.clusters[cluster_num];
+	assert((*lba & MAPPING_UNSYNC_BIT) != 0);
+	*lba ^= MAPPING_UNSYNC_BIT;
 	/* wake up all pending ios */
 	sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
 	assert(sequencer != NULL);
@@ -688,9 +690,9 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 
 #ifdef DEBUG
 	float total = ctx->statistics.read + ctx->statistics.write + ctx->statistics.md;
-	printf("offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
-			ctx->offset, ctx->length, TAILQ_FIRST(&ctx->sequencers)->seq->slice,
-			ctx->statistics.read, ctx->statistics.write, ctx->statistics.md, total);
+	SPDK_DEBUGLOG(io, "offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
+				ctx->offset, ctx->length, TAILQ_FIRST(&ctx->sequencers)->seq->slice,
+				ctx->statistics.read, ctx->statistics.write, ctx->statistics.md, total);
 #endif
 
 	TAILQ_FOREACH_FROM_SAFE(node, &ctx->sequencers, link, tnode) {
@@ -709,13 +711,30 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 }
 
 static void
-blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+blob_cow_persist_valid_slices_cpl(void *arg)
 {
-	struct blob_io_ctx *ctx = cb_arg;
+	struct blob_io_ctx *ctx = arg;
 	struct spdk_blob *blob = ctx->blob;
 	struct cow_sequencer *sequencer;
 	struct cow_sequencer_list_node *node;
 	uint64_t phy_slice;
+
+	/* memory: set valid_slices */
+	TAILQ_FOREACH(node, &ctx->sequencers, link) {
+		sequencer = node->seq;
+		phy_slice = bs_logic_slice_to_physical(blob, sequencer->slice);
+		assert(phy_slice >= blob->bs->num_md_slices);
+		assert(spdk_bit_array_get(blob->bs->valid_slices, phy_slice) == false);
+		bs_set_slice(blob->bs, phy_slice);
+	}
+
+	bs_sequence_finish(ctx->cow_ctx.seq, 0);
+}
+
+static void
+blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct blob_io_ctx *ctx = cb_arg;
 
 	if (bserrno != 0) {
 		SPDK_ERRLOG("persist valid slices failed, rc %d\n", bserrno);
@@ -727,16 +746,7 @@ blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 	ctx->statistics.md = blob_io_ctx_statistics(ctx, true);
 #endif
 
-	/* memory: set valid_slices */
-	TAILQ_FOREACH(node, &ctx->sequencers, link) {
-		sequencer = node->seq;
-		phy_slice = bs_logic_slice_to_physical(blob, sequencer->slice);
-		assert(phy_slice >= blob->bs->num_md_slices);
-		assert(spdk_bit_array_get(blob->bs->valid_slices, phy_slice) == false);
-		bs_set_slice(blob->bs, phy_slice);
-	}
-
-	bs_sequence_finish(seq, bserrno);
+	spdk_thread_send_msg(ctx->cow_ctx.thread, blob_cow_persist_valid_slices_cpl, ctx);
 }
 
 static void
@@ -774,7 +784,7 @@ blob_slice_write_copy_cpl(spdk_bs_sequence_t *sequence, void *cb_arg, int bserrn
 {
 	struct blob_io_ctx *ctx = cb_arg;
 	struct spdk_blob *blob = ctx->blob;
-	void *playload;
+	void *payload;
 
 	if (bserrno) {
 		SPDK_ERRLOG("write slice data failed, rc %d\n", bserrno);
@@ -786,18 +796,23 @@ blob_slice_write_copy_cpl(spdk_bs_sequence_t *sequence, void *cb_arg, int bserrn
 	ctx->statistics.write = blob_io_ctx_statistics(ctx, true);
 #endif
 
-	playload = spdk_malloc(SPDK_BS_PAGE_SIZE, 0, NULL, 
+	payload = spdk_malloc(SPDK_BS_PAGE_SIZE, 0, NULL, 
 					SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-	if (playload == NULL) {
+	if (payload == NULL) {
 		SPDK_ERRLOG("DMA realloc for cluster of size = %" PRIu32 " failed.\n", 
 					SPDK_BS_PAGE_SIZE);
 		bs_sequence_finish(sequence, -ENOMEM);
 		return;
 	}
 
-	ctx->cow_ctx.mask_payload = playload;
+	ctx->cow_ctx.mask_payload = payload;
 	ctx->cow_ctx.thread = spdk_get_thread();
 	spdk_thread_send_msg(blob->bs->md_thread, blob_cow_persist_valid_slices, ctx);
+	// uint64_t cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
+	// SPDK_DEBUGLOG(io, "blob %p, table %p, cluster %lu, lba %lu\n",  
+	// 			blob, blob->active.clusters, cluster_num, 
+	// 			blob->active.clusters[cluster_num] & (~MAPPING_UNSYNC_BIT));
+	// blob_cow_persist_valid_slices_cpl(ctx);
 }
 
 
@@ -809,7 +824,7 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 	uint64_t bytes_count, bytes_offset;
 	uint64_t io_unit_per_slice;
 	uint64_t len_to_boundary;
-	void *playload;
+	void *payload;
 
 	if (ctx->cow_ctx.need_merge_data == false) {
 		return 0;
@@ -820,8 +835,8 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 	if (ctx->start_slice == ctx->end_slice && 
 		ctx->begin_aligned == false && ctx->end_aligned == false) {
 		/* IO range is wrapped by a single slice, beginning and end of IO are both not aligned 
-		 * in this case, the cow_ctx->playload[0] got all the data we need from snapshot
-		 * however, for convenience, we copy the data to cow_ctx->playload[1] */
+		 * in this case, the cow_ctx->payload[0] got all the data we need from snapshot
+		 * however, for convenience, we copy the data to cow_ctx->payload[1] */
 		assert(ctx->cow_ctx.payload[0] && !ctx->cow_ctx.payload[1]);
 		ctx->cow_ctx.payload[1] = spdk_malloc(blob->bs->slice_sz, blob->back_bs_dev->blocklen,
 				       		NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
@@ -864,21 +879,21 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 		bytes_offset = data_io_unit_count * blob->bs->io_unit_size;
 		/* new iovs[0]->iov_len */
 		bytes_count = bytes_offset + iov->iov_len;
-		playload = spdk_realloc(ctx->cow_ctx.payload[0], bytes_count, blob->bs->dev->blocklen);
-		if (playload == NULL) {
+		payload = spdk_realloc(ctx->cow_ctx.payload[0], bytes_count, blob->bs->dev->blocklen);
+		if (payload == NULL) {
 			SPDK_ERRLOG("DMA realloc for cluster of size = %" PRIu64 " failed.\n",
 				    	bytes_count);
 			return -ENOMEM;
 		}
 		/* merge data of iov[0] with payload[0] */
-		memcpy(playload + bytes_offset, iov->iov_base, iov->iov_len);
+		memcpy(payload + bytes_offset, iov->iov_base, iov->iov_len);
 		/* new iov[0] is divided into two parts
 		 * one is the beginning of slice to IO offset
 		 * the other is the orginal iov[0] */
-		iov->iov_base = playload;
+		iov->iov_base = payload;
 		iov->iov_len = bytes_count;
-		/* update playload[0] */
-		ctx->cow_ctx.payload[0] = playload;
+		/* update payload[0] */
+		ctx->cow_ctx.payload[0] = payload;
 		/* new iov[0] have more data, specifically is 'bytes_offset'
 		 * update 'ctx->offset' and 'ctx->length' */
 		assert(ctx->offset > data_io_unit_count);
@@ -917,30 +932,23 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 		bytes_offset = (io_end_offset % io_unit_per_slice) * blob->bs->io_unit_size;
 		iov = &ctx->iovs[ctx->iovcnt-1];
 		/* new iov[m]->iov_base */
-		playload = spdk_malloc(bytes_count + iov->iov_len, blob->bs->dev->blocklen,
+		payload = spdk_malloc(bytes_count + iov->iov_len, blob->bs->dev->blocklen,
 				       	NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		if (playload == NULL) {
+		if (payload == NULL) {
 			SPDK_ERRLOG("DMA realloc for cluster of size = %" PRIu64 " failed.\n",
 				    	bytes_count + iov->iov_len);
 			return -ENOMEM;
 		}
 		/* first, copy original iov[m] data */
-		memcpy(playload, iov->iov_base, iov->iov_len);
+		memcpy(payload, iov->iov_base, iov->iov_len);
 		/* then, merge data of 'len_to_boundary' */
-		memcpy(playload + iov->iov_len, ctx->cow_ctx.payload[1] + bytes_offset, bytes_count);
+		memcpy(payload + iov->iov_len, ctx->cow_ctx.payload[1] + bytes_offset, bytes_count);
 		/* update iov[m] */
-		iov->iov_base = playload;
+		iov->iov_base = payload;
 		iov->iov_len += bytes_count;
-#ifdef DEBUG
-		/* iov[m] may be iov[0], in this case, iov[0]->iov_len == slice_sz */
-		if (ctx->iovcnt == 1) {
-			/* TODO: mkfs assert failed, check why */
-			assert(ctx->iovs[0].iov_len == blob->bs->slice_sz);
-		}
-#endif
-		/* original playload[1] is deprecated, update */
+		/* original payload[1] is deprecated, update */
 		spdk_free(ctx->cow_ctx.payload[1]);
-		ctx->cow_ctx.payload[1] = playload;
+		ctx->cow_ctx.payload[1] = payload;
 		/* update ctx->length */
 		ctx->length += len_to_boundary;
 	}
@@ -992,6 +1000,10 @@ blob_slice_write_copy(void *cb_arg, int bserrno)
 
 #ifdef DEBUG
 	blob_io_ctx_statistics(ctx, false);
+	// uint64_t cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
+	// SPDK_DEBUGLOG(io, "blob %p, table %p, cluster %lu, lba %lu\n",  
+	// 			blob, blob->active.clusters, cluster_num, 
+	// 			blob->active.clusters[cluster_num] & (~MAPPING_UNSYNC_BIT));
 #endif
 
 	bs_sequence_writev_dev(ctx->cow_ctx.seq, ctx->iovs, ctx->iovcnt, lba, ctx->length, 
@@ -1335,6 +1347,7 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 	uint64_t cluster_num;
 	bool is_allocated;
 	int rc;
+	// static uint64_t cache = UINT64_MAX;
 
 	ctx = blob_io_ctx_init(blob, _channel, iov, iovcnt, 
 					offset, length, cb_fn, cb_arg, read);
@@ -1351,6 +1364,7 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			/* mapping IO unfinished */
 			sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
 			assert(sequencer != NULL);
+			assert(sequencer->mapping_io != NULL);
 			/* wait untile mapping IO finish */
 			TAILQ_INSERT_TAIL(&sequencer->pending_ios, ctx, link);
 			return;
@@ -1379,14 +1393,24 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			/* set mapping unsync */
 			blob_insert_cluster(blob, cluster_num, ctx->cow_ctx.new_cluster);
 			blob->active.clusters[cluster_num] |= MAPPING_UNSYNC_BIT;
+			// SPDK_DEBUGLOG(io, "allocate blob %p table %p cluster %lu with lba %lu\n", 
+			// 			blob, blob->active.clusters, cluster_num, 
+			// 			blob->active.clusters[cluster_num] & (~MAPPING_UNSYNC_BIT));
+			// if (cache != UINT64_MAX) {
+			// 	SPDK_DEBUGLOG(io, "blob %p table %p last cluster %lu with lba %lu\n", 
+			// 				blob, blob->active.clusters, cache, 
+			// 				blob->active.clusters[cache] & (~MAPPING_UNSYNC_BIT));
+			// }
+			// cache = cluster_num;
 			pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
+
+			sequencer->mapping_io = ctx;
 
 			if (sequencer->read_count > 0) {
 				/* active read unfinished, should wait */
 				/* pending list must be empty */
 				assert(TAILQ_EMPTY(&sequencer->pending_ios));
 				/* wait until active read finish */
-				sequencer->mapping_io = ctx;
 				return;
 			}
 		}
@@ -2490,7 +2514,7 @@ blob_serialize_extent_page(const struct spdk_blob *blob,
 	desc_extent->start_cluster_idx = start_cluster_idx;
 	extent_idx = 0;
 	for (i = start_cluster_idx; i < blob->active.num_clusters; i++) {
-		lba = blob->active.clusters[i];
+		lba = blob->active.clusters[i] & (~MAPPING_UNSYNC_BIT);
 		desc_extent->cluster_idx[extent_idx++] = lba / lba_per_cluster;
 		if (extent_idx >= SPDK_EXTENTS_PER_EP) {
 			break;
@@ -8761,14 +8785,7 @@ static void
 blob_insert_cluster_msg(void *arg)
 {
 	struct spdk_blob_insert_cluster_ctx *ctx = arg;
-	uint64_t *mapping;
 	uint32_t *extent_page;
-
-	mapping = &ctx->blob->active.clusters[ctx->cluster_num];
-	/* assure unsync bit is set and cluster is allocated */
-	assert((*mapping & MAPPING_UNSYNC_BIT) != 0 && (*mapping ^ MAPPING_UNSYNC_BIT) != 0);
-	/* temporary clear mapping and unsync bit for md sync  */
-	*mapping &= ~(MAPPING_UNSYNC_BIT);
 
 	if (ctx->blob->use_extent_table == false) {
 		/* Extent table is not used, proceed with sync of md that will only use extents_rle. */
@@ -8799,9 +8816,6 @@ blob_insert_cluster_msg(void *arg)
 		blob_write_extent_page(ctx->blob, *extent_page, ctx->cluster_num,
 				       blob_insert_cluster_msg_cb, ctx);
 	}
-	/* set unsync bit, in case that when md synchronization unfinished,
-	 * a IO arrive, mistakenly takes cluster is allocated and mapping pesisted */
-	*mapping |= MAPPING_UNSYNC_BIT;
 }
 
 static void
