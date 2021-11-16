@@ -13,6 +13,8 @@ sleep 3
 $SCRIPTS/setup.sh cleanup &> /dev/null
 $SCRIPTS/setup.sh reset &> /dev/null
 
+sleep 3
+
 if [ $# -eq 1 ];
 then
     device="/dev/nvme0n1"
