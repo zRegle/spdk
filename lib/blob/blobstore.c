@@ -580,6 +580,13 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 		}
 	}
 
+#ifdef DEBUG
+	ctx->statistics.md = blob_io_ctx_statistics(ctx, true);
+	struct spdk_blob_store *bs = ctx->blob->bs;
+	bs->cluster.cnt++;
+	bs->cluster.u.mapping_io.md += ctx->statistics.md;
+#endif
+
 	/* clear unsync bit */
 	cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
 	lba = &blob->active.clusters[cluster_num];
@@ -637,8 +644,17 @@ blob_end_io(struct blob_io_ctx *ctx, int bserrno)
 				}
 			}
 		} else {
+		#ifdef DEBUG	
+			ctx->statistics.md = blob_io_ctx_statistics(ctx, false);
+		#endif
 			blob_insert_cluster_on_md_thread(ctx->blob, cluster_num, ctx->cow_ctx.new_cluster,
 							ctx->cow_ctx.new_extent_page, blob_insert_cluster_cpl, ctx);
+			// uint32_t *extent_page = bs_cluster_to_extent_page(ctx->blob, cluster_num);
+			// if (*extent_page == 0) {
+			// 	assert(ctx->cow_ctx.new_extent_page != 0);
+			// 	*extent_page = ctx->cow_ctx.new_extent_page;
+			// }
+			// blob_insert_cluster_cpl(ctx, 0);
 			return;
 		}
 	}
@@ -670,6 +686,13 @@ blob_subio_rw_iov_done(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct blob_io_ctx *subio = cb_arg;
 
+#ifdef DEBUG
+	subio->statistics.write = blob_io_ctx_statistics(subio, true);
+	struct spdk_blob_store *bs = subio->blob->bs;
+	bs->normal.u.normal.write += subio->statistics.write;
+	bs->normal.cnt++;
+#endif
+
 	bs_sequence_finish(seq, bserrno);
 	blob_free_io_ctx(subio);
 }
@@ -690,9 +713,16 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 
 #ifdef DEBUG
 	float total = ctx->statistics.read + ctx->statistics.write + ctx->statistics.md;
-	SPDK_DEBUGLOG(io, "offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
+	printf("offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
 				ctx->offset, ctx->length, TAILQ_FIRST(&ctx->sequencers)->seq->slice,
 				ctx->statistics.read, ctx->statistics.write, ctx->statistics.md, total);
+	
+	struct spdk_blob_store *bs = ctx->blob->bs;
+	bs->slice.cnt++;
+	bs->slice.u.cow_io.total += total;
+	bs->slice.u.cow_io.read += ctx->statistics.read;
+	bs->slice.u.cow_io.write += ctx->statistics.write;
+	bs->slice.u.cow_io.md += ctx->statistics.md;
 #endif
 
 	TAILQ_FOREACH_FROM_SAFE(node, &ctx->sequencers, link, tnode) {
@@ -1053,6 +1083,11 @@ blob_slice_copy_on_write(struct blob_io_ctx *ctx)
 			bs_batch_read_bs_dev(batch, blob->back_bs_dev, ctx->cow_ctx.payload[0],
 							bs_dev_page_to_lba(blob->back_bs_dev, slice_start_page),
 							bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->slice_sz));
+						
+		#ifdef DEBUG
+			blob_io_statistics *stat = &blob->bs->slice;
+			stat->u.cow_io.begin_not_aligned++;
+		#endif
 		}
 
 		if (((ctx->offset + ctx->length) * blob->bs->io_unit_size) % blob->bs->slice_sz) {
@@ -1074,6 +1109,10 @@ blob_slice_copy_on_write(struct blob_io_ctx *ctx)
 				bs_batch_read_bs_dev(batch, blob->back_bs_dev, ctx->cow_ctx.payload[1],
 								bs_dev_page_to_lba(blob->back_bs_dev, slice_start_page),
 								bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->slice_sz));
+			#ifdef DEBUG
+				blob_io_statistics *stat = &blob->bs->slice;
+				stat->u.cow_io.end_not_aligned++;
+			#endif
 			}
 		}
 
@@ -1142,6 +1181,9 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 			bs_sequence_readv_dev(seq, ctx->iovs, ctx->iovcnt, lba, lba_count, 
 							blob_subio_rw_iov_done, ctx);
 		} else {
+		#ifdef DEBUG
+			blob_io_ctx_statistics(ctx, false);
+		#endif
 			bs_sequence_writev_dev(seq, ctx->iovs, ctx->iovcnt, lba, lba_count, 
 							blob_subio_rw_iov_done, ctx);
 		}
@@ -1155,6 +1197,9 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 	TAILQ_FOREACH(node, &ctx->sequencers, link) {
 		seq = node->seq;
 		if (seq->cow_io && seq->cow_io != ctx) {
+		#ifdef DEBUG
+			ctx->blob->bs->slice.wait++;
+		#endif
 			assert(mask == ACTIVE_IO);
 			TAILQ_INSERT_TAIL(&seq->pending_ios, ctx, link);
 			return;
@@ -1164,6 +1209,9 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 		} else {
 			seq->cow_io = ctx;
 			if (seq->read_count > 0) {
+			#ifdef DEBUG
+				ctx->blob->bs->slice.wait++;
+			#endif
 				assert(mask == ACTIVE_IO);
 				assert(TAILQ_EMPTY(&seq->pending_ios));
 				return;
@@ -1365,8 +1413,11 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
 			assert(sequencer != NULL);
 			assert(sequencer->mapping_io != NULL);
-			/* wait untile mapping IO finish */
+			/* wait until mapping IO finish */
 			TAILQ_INSERT_TAIL(&sequencer->pending_ios, ctx, link);
+		#ifdef DEBUG
+			blob->bs->cluster.wait++;
+		#endif
 			return;
 		} else {
 			blob_prepare_io(ctx);
@@ -1407,6 +1458,9 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			sequencer->mapping_io = ctx;
 
 			if (sequencer->read_count > 0) {
+			#ifdef DEBUG
+				blob->bs->cluster.wait++;
+			#endif
 				/* active read unfinished, should wait */
 				/* pending list must be empty */
 				assert(TAILQ_EMPTY(&sequencer->pending_ios));
@@ -4201,6 +4255,10 @@ rw_iov_split_next(void *cb_arg, int bserrno)
 		free(ctx);
 		return;
 	}
+
+#ifdef DEBUG
+	blob->bs->cluster.u.mapping_io.split++;
+#endif
 
 	io_unit_offset = ctx->io_unit_offset;
 	io_units_to_boundary = bs_num_io_units_to_cluster_boundary(blob, io_unit_offset);
@@ -9360,6 +9418,23 @@ spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_
 
 	return 0;
 }
+
+#ifdef DEBUG
+blob_io_statistics*
+spdk_bs_get_io_statistics(struct spdk_blob_store *bs, enum bs_io_type type)
+{
+	switch (type) {
+		case NORMAL:
+			return &bs->normal;
+		case COW:
+			return &bs->slice;
+		case MAPPING:
+			return &bs->cluster;
+		default:
+			return NULL;
+	}
+}
+#endif
 
 SPDK_LOG_REGISTER_COMPONENT(blob)
 SPDK_LOG_REGISTER_COMPONENT(io)

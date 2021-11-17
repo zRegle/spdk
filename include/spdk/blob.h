@@ -96,6 +96,42 @@ struct spdk_io_channel;
 struct spdk_blob;
 struct spdk_xattr_names;
 
+#ifdef DEBUG
+typedef struct  {
+	uint32_t cnt;
+	uint32_t wait;
+	union {
+		struct {
+			float total;
+			float read;
+			float write;
+			float md;
+			uint32_t begin_not_aligned;
+			uint32_t end_not_aligned;
+		} cow_io;
+
+		struct {
+			uint32_t split;
+			float md;
+		} mapping_io;
+
+		struct {
+			float read;
+			float write;
+		} normal;
+	} u;
+} blob_io_statistics;
+
+enum bs_io_type {
+	NORMAL,
+	COW,
+	MAPPING
+};
+
+blob_io_statistics* 
+spdk_bs_get_io_statistics(struct spdk_blob_store *bs, enum bs_io_type type);
+#endif
+
 /**
  * Blobstore operation completion callback.
  *

@@ -1019,6 +1019,40 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 
 	spdk_json_write_named_uint64(w, "slice_size", slice_size);
 
+#ifdef DEBUG
+	spdk_json_write_named_array_begin(w, "statistics");
+
+	/* cow_io */
+	blob_io_statistics *stat = NULL;
+	stat = spdk_bs_get_io_statistics(bs, COW);
+
+	spdk_json_write_string_fmt(w, "cow cnt: %u", stat->cnt);
+	spdk_json_write_string_fmt(w, "wait: %u", stat->wait);
+	spdk_json_write_string_fmt(w, "total: %.3f", stat->u.cow_io.total / stat->cnt);
+	spdk_json_write_string_fmt(w, "read: %.3f", stat->u.cow_io.read / stat->cnt);
+	spdk_json_write_string_fmt(w, "write: %.3f", stat->u.cow_io.write / stat->cnt);
+	spdk_json_write_string_fmt(w, "md: %.3f", stat->u.cow_io.md / stat->cnt);
+	spdk_json_write_string_fmt(w, "begin_not_aligned: %u", stat->u.cow_io.begin_not_aligned);
+	spdk_json_write_string_fmt(w, "end_not_aligned: %u", stat->u.cow_io.end_not_aligned);
+
+	/* mapping_io */
+	stat = spdk_bs_get_io_statistics(bs, MAPPING);
+
+	spdk_json_write_string_fmt(w, "mapping cnt: %u", stat->cnt);
+	spdk_json_write_string_fmt(w, "wait: %u", stat->wait);
+	spdk_json_write_string_fmt(w, "split: %u", stat->u.mapping_io.split);
+	spdk_json_write_string_fmt(w, "md: %.3f", stat->u.mapping_io.md / stat->cnt);
+
+	/* normal_io */
+	stat = spdk_bs_get_io_statistics(bs, NORMAL);
+
+	spdk_json_write_string_fmt(w, "normal cnt: %u", stat->cnt);
+	spdk_json_write_string_fmt(w, "write: %.3f", stat->u.normal.write / stat->cnt);
+	spdk_json_write_string_fmt(w, "read: %.3f", stat->u.normal.read / stat->cnt);
+
+	spdk_json_write_array_end(w);
+#endif
+
 	spdk_json_write_object_end(w);
 }
 

@@ -311,6 +311,11 @@ struct spdk_blob_store {
 	TAILQ_HEAD(, spdk_blob_list)	snapshots;
 
 	bool                            clean;
+#ifdef DEBUG
+	blob_io_statistics slice;
+	blob_io_statistics cluster;
+	blob_io_statistics normal;
+#endif
 };
 
 struct spdk_bs_channel {
