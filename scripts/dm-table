@@ -1,0 +1,2 @@
+0 md linear /dev/sdb 0
+md 1073741824 linear /dev/sdc 0

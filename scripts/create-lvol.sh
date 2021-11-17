@@ -37,7 +37,27 @@ $RPC framework_wait_init
 
 if [ $# -eq 2 ];
 then
-    device="/dev/$2"
+    if [ "$2" == "dm" ];
+    then
+        blockcnt=$(( 1024 * 1024 * 1024 ))
+        # calculate the size of md region(count in byte)
+        md_bytes=$($SCRIPTS/calc-md $blockcnt 512 $size)
+        # save md_bytes
+        echo $md_bytes > $SCRIPTS/md_bytes
+        # set md_region in dm-table
+        sed -i "s/md/$md_bytes/g" $SCRIPTS/dm-table
+        # create linear device
+        dmsetup create dm0 $SCRIPTS/dm-table
+        if [ $? -ne 0 ];
+        then
+            echo "dmsetup create failed"
+            exit 1
+        fi
+        device="/dev/mapper/dm0"
+    else
+        device="/dev/$2"
+    fi
+
     $RPC bdev_aio_create $device aio0
     bdev="aio0"
 else
