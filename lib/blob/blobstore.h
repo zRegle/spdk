@@ -56,6 +56,9 @@
 #define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
 
 #define MAPPING_UNSYNC_BIT (1ULL << 63)
+#define BS_PAGE_MEM_POOL_SIZE 1024
+#define BS_SLICE_MEM_POOL_SIZE 512
+#define BS_MERGE_MEM_POOL_SIZE 512
 
 struct cow_sequencer;
 struct mapping_sequencer;
@@ -95,10 +98,10 @@ struct blob_io_ctx {
 		uint64_t new_cluster;
 		uint32_t new_extent_page;
 		/* two buffer for data merge */
-		void *payload[2];
+		struct blob_io_buf *merge_buf[2];
 		spdk_bs_sequence_t *seq;
 		/* valid_slices buffer */
-		void *mask_payload;
+		struct blob_io_buf *ele;
 		bool need_merge_data;
 	} cow_ctx;
 	uint64_t start_slice;
@@ -138,6 +141,24 @@ struct cow_sequencer_list_node {
 	struct cow_sequencer *seq;
 	TAILQ_ENTRY(cow_sequencer_list_node) link;
 };
+
+enum buf_type {
+	PAGE, /* for persist valid_slices mask */
+	SLICE, /* for CoW read buffer */
+	MERGE /* for CoW merge write buffer */
+};
+
+struct blob_io_buf {
+	uint8_t *buf;
+	enum buf_type type;
+	TAILQ_ENTRY(blob_io_buf) link;
+};
+
+typedef struct {
+	TAILQ_HEAD(, blob_io_buf) page_pool;
+	TAILQ_HEAD(, blob_io_buf) slice_pool;
+	TAILQ_HEAD(, blob_io_buf) merge_pool;
+} mem_pool_factory;
 
 struct spdk_xattr {
 	uint32_t	index;
@@ -311,10 +332,11 @@ struct spdk_blob_store {
 	TAILQ_HEAD(, spdk_blob_list)	snapshots;
 
 	bool                            clean;
+
+	mem_pool_factory	*factory;
 #ifdef DEBUG
 	blob_io_statistics slice;
 	blob_io_statistics cluster;
-	blob_io_statistics normal;
 #endif
 };
 

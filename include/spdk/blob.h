@@ -114,11 +114,6 @@ typedef struct  {
 			uint32_t split;
 			float md;
 		} mapping_io;
-
-		struct {
-			float read;
-			float write;
-		} normal;
 	} u;
 } blob_io_statistics;
 

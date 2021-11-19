@@ -1043,13 +1043,6 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_string_fmt(w, "split: %u", stat->u.mapping_io.split);
 	spdk_json_write_string_fmt(w, "md: %.3f", stat->u.mapping_io.md / stat->cnt);
 
-	/* normal_io */
-	stat = spdk_bs_get_io_statistics(bs, NORMAL);
-
-	spdk_json_write_string_fmt(w, "normal cnt: %u", stat->cnt);
-	spdk_json_write_string_fmt(w, "write: %.3f", stat->u.normal.write / stat->cnt);
-	spdk_json_write_string_fmt(w, "read: %.3f", stat->u.normal.read / stat->cnt);
-
 	spdk_json_write_array_end(w);
 #endif
 

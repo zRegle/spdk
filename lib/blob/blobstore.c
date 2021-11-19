@@ -91,9 +91,9 @@ enum slice_status {
 
 #ifdef DEBUG
 static float
-blob_io_ctx_statistics(struct blob_io_ctx *ctx, bool is_end)
+blob_io_ctx_statistics(struct timespec *start, bool is_end)
 {
-	struct timespec *start = &ctx->statistics.ts, end;
+	struct timespec end;
 
 	if (is_end) {
 		clock_gettime(CLOCK_REALTIME, &end);
@@ -106,6 +106,200 @@ blob_io_ctx_statistics(struct blob_io_ctx *ctx, bool is_end)
 	}
 }
 #endif
+
+static inline uint32_t
+bs_mem_buf_getsz(struct spdk_blob_store *bs, enum buf_type type)
+{
+	switch (type) {
+		case PAGE:
+			return SPDK_BS_PAGE_SIZE;
+		case SLICE:
+			return bs->slice_sz;
+		case MERGE:
+			return bs->slice_sz * 2;
+		default:
+			return UINT32_MAX;
+	}
+}
+
+static int
+bs_mem_pool_init(struct spdk_blob_store *bs, enum buf_type type, uint32_t pool_sz)
+{
+	struct blob_io_buf *ele = NULL;
+	typeof(&bs->factory->page_pool) queue;
+	uint32_t i, buf_size;
+
+	switch (type) {
+		case PAGE:
+			TAILQ_INIT(&bs->factory->page_pool);
+			buf_size = bs_mem_buf_getsz(bs, PAGE);
+			queue = &bs->factory->page_pool;
+			break;
+		case SLICE:
+			TAILQ_INIT(&bs->factory->slice_pool);
+			buf_size = bs_mem_buf_getsz(bs, SLICE);
+			queue = &bs->factory->slice_pool;
+			break;
+		case MERGE:
+			TAILQ_INIT(&bs->factory->merge_pool);
+			buf_size = bs_mem_buf_getsz(bs, MERGE);
+			queue = &bs->factory->merge_pool;
+			break;
+		default:
+			return -EINVAL;
+	}
+
+	/* init mem pool */
+	for (i = 0; i < pool_sz; i++) {
+		/* allocate buffer node */
+		ele = calloc(1, sizeof(struct blob_io_buf));
+		if (ele == NULL) {
+			SPDK_ERRLOG("calloc failed\n");
+			return -ENOMEM;
+		}
+		/* allocate DMA buffer */
+		ele->buf = spdk_malloc(buf_size, 0, NULL, 
+					SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (ele->buf == NULL) {
+			SPDK_ERRLOG("spdk_malloc failed\n");
+			free(ele);
+			return -ENOMEM;
+		}
+		ele->type = type;
+		TAILQ_INSERT_TAIL(queue, ele, link);
+	}
+
+	return 0;
+}
+
+static void
+bs_mem_pool_destroy(struct spdk_blob_store *bs, enum buf_type type)
+{
+	struct blob_io_buf *ele = NULL, *tele;
+	typeof(&bs->factory->page_pool) queue;
+	
+	switch (type) {
+		case PAGE:
+			queue = &bs->factory->page_pool;
+			break;
+		case SLICE:
+			queue = &bs->factory->slice_pool;
+			break;
+		case MERGE:
+			queue = &bs->factory->merge_pool;
+			break;
+		default:
+			return;
+	}
+
+	TAILQ_FOREACH_FROM_SAFE(ele, queue, link, tele) {
+		TAILQ_REMOVE(queue, ele, link);
+		spdk_free(ele->buf);
+		free(ele);
+	}
+}
+
+static void
+bs_mem_factory_destroy(struct spdk_blob_store *bs)
+{
+	bs_mem_pool_destroy(bs, PAGE);
+	bs_mem_pool_destroy(bs, SLICE);
+	bs_mem_pool_destroy(bs, MERGE);
+
+	free(bs->factory);
+}
+
+static int
+bs_mem_factory_init(struct spdk_blob_store *bs)
+{
+	int rc;
+
+	bs->factory = calloc(1, sizeof(mem_pool_factory));
+	if (bs->factory == NULL) {
+		rc = -ENOMEM;
+		goto exit;
+	}
+
+	/* init page mem pool */
+	rc = bs_mem_pool_init(bs, PAGE, BS_PAGE_MEM_POOL_SIZE);
+	if (rc != 0) {
+		goto exit;
+	}
+	/* init slice mem pool */
+	rc = bs_mem_pool_init(bs, SLICE, BS_SLICE_MEM_POOL_SIZE);
+	if (rc != 0) {
+		goto exit;
+	}
+
+	rc = bs_mem_pool_init(bs, MERGE, BS_MERGE_MEM_POOL_SIZE);
+	if (rc != 0) {
+		goto exit;
+	}
+
+	return 0;
+
+exit:
+	bs_mem_factory_destroy(bs);
+	return rc;
+}
+
+static struct blob_io_buf*
+bs_mem_factory_get(struct spdk_blob_store *bs, enum buf_type type)
+{
+	struct blob_io_buf *ele = NULL;
+	typeof(&bs->factory->page_pool) queue;
+
+	switch (type) {
+		case PAGE:
+			queue = &bs->factory->page_pool;
+			break;
+		case SLICE:
+			queue = &bs->factory->slice_pool;
+			break;
+		case MERGE:
+			queue = &bs->factory->merge_pool;
+			break;
+		default:
+			SPDK_ERRLOG("invalid buffer type: %d\n", type);
+			return NULL;
+	}
+
+	ele = TAILQ_FIRST(queue);
+	if (ele == NULL) {
+		SPDK_ERRLOG("pool %d OOM\n", type);
+		return NULL;
+	}
+
+	TAILQ_REMOVE(queue, ele, link);
+
+	return ele;
+}
+
+static void
+bs_mem_factory_put(struct spdk_blob_store *bs, struct blob_io_buf *ele)
+{
+	typeof(&bs->factory->page_pool) queue;
+
+	assert(ele != NULL);
+	assert(ele->buf != NULL);
+
+	switch (ele->type) {
+		case PAGE:
+			queue = &bs->factory->page_pool;
+			break;
+		case SLICE:
+			queue = &bs->factory->slice_pool;
+			break;
+		case MERGE:
+			queue = &bs->factory->merge_pool;
+			break;
+		default:
+			SPDK_ERRLOG("invalid buffer type: %d\n", ele->type);
+			assert(0);
+	}
+
+	TAILQ_INSERT_TAIL(queue, ele, link);
+}
 
 static void
 bs_set_slice(struct spdk_blob_store *bs, uint64_t slice)
@@ -485,12 +679,6 @@ blob_free_io_ctx(struct blob_io_ctx *ctx)
 	if (ctx) {
 		if (ctx->iovs)
 			free(ctx->iovs);
-		if (ctx->cow_ctx.payload[0])
-			spdk_free(ctx->cow_ctx.payload[0]);
-		if (ctx->cow_ctx.payload[1])
-			spdk_free(ctx->cow_ctx.payload[1]);
-		if (ctx->cow_ctx.mask_payload)
-			spdk_free(ctx->cow_ctx.mask_payload);
 		TAILQ_FOREACH_FROM_SAFE(node, &ctx->sequencers, link, tnode) {
 			TAILQ_REMOVE(&ctx->sequencers, node, link);
 			free(node);
@@ -581,7 +769,7 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 	}
 
 #ifdef DEBUG
-	ctx->statistics.md = blob_io_ctx_statistics(ctx, true);
+	ctx->statistics.md = blob_io_ctx_statistics(&ctx->statistics.ts, true);
 	struct spdk_blob_store *bs = ctx->blob->bs;
 	bs->cluster.cnt++;
 	bs->cluster.u.mapping_io.md += ctx->statistics.md;
@@ -645,7 +833,7 @@ blob_end_io(struct blob_io_ctx *ctx, int bserrno)
 			}
 		} else {
 		#ifdef DEBUG	
-			ctx->statistics.md = blob_io_ctx_statistics(ctx, false);
+			ctx->statistics.md = blob_io_ctx_statistics(&ctx->statistics.ts, false);
 		#endif
 			blob_insert_cluster_on_md_thread(ctx->blob, cluster_num, ctx->cow_ctx.new_cluster,
 							ctx->cow_ctx.new_extent_page, blob_insert_cluster_cpl, ctx);
@@ -685,13 +873,6 @@ static void
 blob_subio_rw_iov_done(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct blob_io_ctx *subio = cb_arg;
-
-#ifdef DEBUG
-	subio->statistics.write = blob_io_ctx_statistics(subio, true);
-	struct spdk_blob_store *bs = subio->blob->bs;
-	bs->normal.u.normal.write += subio->statistics.write;
-	bs->normal.cnt++;
-#endif
 
 	bs_sequence_finish(seq, bserrno);
 	blob_free_io_ctx(subio);
@@ -773,8 +954,10 @@ blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 	}
 
 #ifdef DEBUG
-	ctx->statistics.md = blob_io_ctx_statistics(ctx, true);
+	ctx->statistics.md = blob_io_ctx_statistics(&ctx->statistics.ts, true);
 #endif
+
+	bs_mem_factory_put(ctx->blob->bs, ctx->cow_ctx.ele);
 
 	spdk_thread_send_msg(ctx->cow_ctx.thread, blob_cow_persist_valid_slices_cpl, ctx);
 }
@@ -798,12 +981,12 @@ blob_cow_persist_valid_slices(void *arg)
 		assert(bs_slice_to_md_page(blob->bs, phy_slice) == md_page);
 	}
 
-	blob_io_ctx_statistics(ctx, false);
+	blob_io_ctx_statistics(&ctx->statistics.ts, false);
 #endif
 
 	/* persist valid_slices */
-	blob_serialize_slice_page(blob, phy_slice, ctx->cow_ctx.mask_payload);
-	bs_sequence_write_dev(ctx->cow_ctx.seq, ctx->cow_ctx.mask_payload, 
+	blob_serialize_slice_page(blob, phy_slice, ctx->cow_ctx.ele->buf);
+	bs_sequence_write_dev(ctx->cow_ctx.seq, ctx->cow_ctx.ele->buf, 
 					bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + md_page),
 					bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
 					blob_cow_persist_valid_slices_cb, ctx);
@@ -814,7 +997,7 @@ blob_slice_write_copy_cpl(spdk_bs_sequence_t *sequence, void *cb_arg, int bserrn
 {
 	struct blob_io_ctx *ctx = cb_arg;
 	struct spdk_blob *blob = ctx->blob;
-	void *payload;
+	struct blob_io_buf *buf = NULL;
 
 	if (bserrno) {
 		SPDK_ERRLOG("write slice data failed, rc %d\n", bserrno);
@@ -823,19 +1006,23 @@ blob_slice_write_copy_cpl(spdk_bs_sequence_t *sequence, void *cb_arg, int bserrn
 	}
 
 #ifdef DEBUG
-	ctx->statistics.write = blob_io_ctx_statistics(ctx, true);
+	ctx->statistics.write = blob_io_ctx_statistics(&ctx->statistics.ts, true);
 #endif
 
-	payload = spdk_malloc(SPDK_BS_PAGE_SIZE, 0, NULL, 
-					SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-	if (payload == NULL) {
-		SPDK_ERRLOG("DMA realloc for cluster of size = %" PRIu32 " failed.\n", 
-					SPDK_BS_PAGE_SIZE);
+	if (ctx->cow_ctx.merge_buf[0] != NULL) {
+		bs_mem_factory_put(blob->bs, ctx->cow_ctx.merge_buf[0]);
+	}
+	if (ctx->cow_ctx.merge_buf[1] != NULL) {
+		bs_mem_factory_put(blob->bs, ctx->cow_ctx.merge_buf[1]);
+	}
+
+	buf = bs_mem_factory_get(blob->bs, PAGE);
+	if (buf == NULL) {
 		bs_sequence_finish(sequence, -ENOMEM);
 		return;
 	}
 
-	ctx->cow_ctx.mask_payload = payload;
+	ctx->cow_ctx.ele = buf;
 	ctx->cow_ctx.thread = spdk_get_thread();
 	spdk_thread_send_msg(blob->bs->md_thread, blob_cow_persist_valid_slices, ctx);
 	// uint64_t cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
@@ -854,7 +1041,7 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 	uint64_t bytes_count, bytes_offset;
 	uint64_t io_unit_per_slice;
 	uint64_t len_to_boundary;
-	void *payload;
+	struct blob_io_buf *payload;
 
 	if (ctx->cow_ctx.need_merge_data == false) {
 		return 0;
@@ -867,20 +1054,17 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 		/* IO range is wrapped by a single slice, beginning and end of IO are both not aligned 
 		 * in this case, the cow_ctx->payload[0] got all the data we need from snapshot
 		 * however, for convenience, we copy the data to cow_ctx->payload[1] */
-		assert(ctx->cow_ctx.payload[0] && !ctx->cow_ctx.payload[1]);
-		ctx->cow_ctx.payload[1] = spdk_malloc(blob->bs->slice_sz, blob->back_bs_dev->blocklen,
-				       		NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		if (ctx->cow_ctx.payload[1] == NULL) {
-			SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
-				    	blob->bs->slice_sz);
+		assert(ctx->cow_ctx.merge_buf[0] && !ctx->cow_ctx.merge_buf[1]);
+		ctx->cow_ctx.merge_buf[1] = bs_mem_factory_get(blob->bs, SLICE);
+		if (ctx->cow_ctx.merge_buf[1] == NULL) {
 			return -ENOMEM;
 		}
-		memcpy(ctx->cow_ctx.payload[1], ctx->cow_ctx.payload[0], blob->bs->slice_sz);
+		memcpy(ctx->cow_ctx.merge_buf[1]->buf, ctx->cow_ctx.merge_buf[0]->buf, blob->bs->slice_sz);
 	}
 
 	if (!ctx->begin_aligned) {
 		uint64_t data_io_unit_count;
-		assert(ctx->cow_ctx.payload[0] != NULL);
+		assert(ctx->cow_ctx.merge_buf[0] != NULL);
 		/**
 		 * IO beginning not aligned
 		 * in this case, slice and the iov[0]->iov_base shoud look like this
@@ -909,21 +1093,21 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 		bytes_offset = data_io_unit_count * blob->bs->io_unit_size;
 		/* new iovs[0]->iov_len */
 		bytes_count = bytes_offset + iov->iov_len;
-		payload = spdk_realloc(ctx->cow_ctx.payload[0], bytes_count, blob->bs->dev->blocklen);
+		payload = bs_mem_factory_get(blob->bs, MERGE);
 		if (payload == NULL) {
-			SPDK_ERRLOG("DMA realloc for cluster of size = %" PRIu64 " failed.\n",
-				    	bytes_count);
 			return -ENOMEM;
 		}
+		memcpy(payload->buf, ctx->cow_ctx.merge_buf[0]->buf, blob->bs->slice_sz);
 		/* merge data of iov[0] with payload[0] */
-		memcpy(payload + bytes_offset, iov->iov_base, iov->iov_len);
+		memcpy(payload->buf + bytes_offset, iov->iov_base, iov->iov_len);
 		/* new iov[0] is divided into two parts
 		 * one is the beginning of slice to IO offset
 		 * the other is the orginal iov[0] */
-		iov->iov_base = payload;
+		iov->iov_base = payload->buf;
 		iov->iov_len = bytes_count;
 		/* update payload[0] */
-		ctx->cow_ctx.payload[0] = payload;
+		bs_mem_factory_put(blob->bs, ctx->cow_ctx.merge_buf[0]);
+		ctx->cow_ctx.merge_buf[0] = payload;
 		/* new iov[0] have more data, specifically is 'bytes_offset'
 		 * update 'ctx->offset' and 'ctx->length' */
 		assert(ctx->offset > data_io_unit_count);
@@ -932,7 +1116,7 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 	}
 
 	if (!ctx->end_aligned) {
-		assert(ctx->cow_ctx.payload[1] != NULL);
+		assert(ctx->cow_ctx.merge_buf[1] != NULL);
 		/**
 		 * Io end not aligned
 		 * in this case, slice and the iov[m]->iov_base shoud look like this
@@ -962,23 +1146,20 @@ blob_io_cow_merge_data(struct blob_io_ctx *ctx)
 		bytes_offset = (io_end_offset % io_unit_per_slice) * blob->bs->io_unit_size;
 		iov = &ctx->iovs[ctx->iovcnt-1];
 		/* new iov[m]->iov_base */
-		payload = spdk_malloc(bytes_count + iov->iov_len, blob->bs->dev->blocklen,
-				       	NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		payload = bs_mem_factory_get(blob->bs, MERGE);
 		if (payload == NULL) {
-			SPDK_ERRLOG("DMA realloc for cluster of size = %" PRIu64 " failed.\n",
-				    	bytes_count + iov->iov_len);
 			return -ENOMEM;
 		}
 		/* first, copy original iov[m] data */
-		memcpy(payload, iov->iov_base, iov->iov_len);
+		memcpy(payload->buf, iov->iov_base, iov->iov_len);
 		/* then, merge data of 'len_to_boundary' */
-		memcpy(payload + iov->iov_len, ctx->cow_ctx.payload[1] + bytes_offset, bytes_count);
+		memcpy(payload->buf + iov->iov_len, ctx->cow_ctx.merge_buf[1]->buf + bytes_offset, bytes_count);
 		/* update iov[m] */
-		iov->iov_base = payload;
+		iov->iov_base = payload->buf;
 		iov->iov_len += bytes_count;
 		/* original payload[1] is deprecated, update */
-		spdk_free(ctx->cow_ctx.payload[1]);
-		ctx->cow_ctx.payload[1] = payload;
+		bs_mem_factory_put(blob->bs, ctx->cow_ctx.merge_buf[1]);
+		ctx->cow_ctx.merge_buf[1] = payload;
 		/* update ctx->length */
 		ctx->length += len_to_boundary;
 	}
@@ -1003,7 +1184,7 @@ blob_slice_write_copy(void *cb_arg, int bserrno)
 	}
 
 #ifdef DEBUG
-	ctx->statistics.read = blob_io_ctx_statistics(ctx, true);
+	ctx->statistics.read = blob_io_ctx_statistics(&ctx->statistics.ts, true);
 #endif
 
 	rc = blob_io_cow_merge_data(ctx);
@@ -1029,7 +1210,7 @@ blob_slice_write_copy(void *cb_arg, int bserrno)
 	}
 
 #ifdef DEBUG
-	blob_io_ctx_statistics(ctx, false);
+	blob_io_ctx_statistics(&ctx->statistics.ts, false);
 	// uint64_t cluster_num = bs_slice_to_cluster(blob, ctx->start_slice);
 	// SPDK_DEBUGLOG(io, "blob %p, table %p, cluster %lu, lba %lu\n",  
 	// 			blob, blob->active.clusters, cluster_num, 
@@ -1072,15 +1253,12 @@ blob_slice_copy_on_write(struct blob_io_ctx *ctx)
 			ctx->begin_aligned = false;
 			/* Round the io_unit offset down to the first page in the slice */
 			slice_start_page = bs_io_unit_to_slice_start(blob, ctx->offset);
-			ctx->cow_ctx.payload[0] = spdk_malloc(blob->bs->slice_sz, blob->back_bs_dev->blocklen,
-				       		NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-			if (!ctx->cow_ctx.payload[0]) {
-				SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
-				    	blob->bs->slice_sz);
+			ctx->cow_ctx.merge_buf[0] = bs_mem_factory_get(blob->bs, SLICE);
+			if (!ctx->cow_ctx.merge_buf[0]) {
 				blob_slice_write_copy(ctx, -ENOMEM);
 				return;
 			}
-			bs_batch_read_bs_dev(batch, blob->back_bs_dev, ctx->cow_ctx.payload[0],
+			bs_batch_read_bs_dev(batch, blob->back_bs_dev, ctx->cow_ctx.merge_buf[0]->buf,
 							bs_dev_page_to_lba(blob->back_bs_dev, slice_start_page),
 							bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->slice_sz));
 						
@@ -1098,15 +1276,12 @@ blob_slice_copy_on_write(struct blob_io_ctx *ctx)
 				 * we should read the slice where the end located */
 				/* Round the io_unit offset down to the first page in the slice */
 				slice_start_page = bs_io_unit_to_slice_start(blob, ctx->offset + ctx->length);
-				ctx->cow_ctx.payload[1] = spdk_malloc(blob->bs->slice_sz, blob->back_bs_dev->blocklen,
-								NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-				if (!ctx->cow_ctx.payload[1]) {
-					SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
-					    	blob->bs->slice_sz);
+				ctx->cow_ctx.merge_buf[1] = bs_mem_factory_get(blob->bs, SLICE);
+				if (!ctx->cow_ctx.merge_buf[1]) {
 					blob_slice_write_copy(ctx, -ENOMEM);
 					return;
 				}
-				bs_batch_read_bs_dev(batch, blob->back_bs_dev, ctx->cow_ctx.payload[1],
+				bs_batch_read_bs_dev(batch, blob->back_bs_dev, ctx->cow_ctx.merge_buf[1]->buf,
 								bs_dev_page_to_lba(blob->back_bs_dev, slice_start_page),
 								bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->slice_sz));
 			#ifdef DEBUG
@@ -1182,7 +1357,7 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 							blob_subio_rw_iov_done, ctx);
 		} else {
 		#ifdef DEBUG
-			blob_io_ctx_statistics(ctx, false);
+			blob_io_ctx_statistics(&ctx->statistics.ts, false);
 		#endif
 			bs_sequence_writev_dev(seq, ctx->iovs, ctx->iovcnt, lba, lba_count, 
 							blob_subio_rw_iov_done, ctx);
@@ -1233,7 +1408,7 @@ blob_handle_subio(struct blob_io_ctx *ctx, int mask)
 						lba, lba_count, blob_redirect_read_cpl, ctx);
 	} else {
 #ifdef DEBUG
-		blob_io_ctx_statistics(ctx, false);
+		blob_io_ctx_statistics(&ctx->statistics.ts, false);
 #endif
 		blob_slice_copy_on_write(ctx);
 	}
@@ -4534,6 +4709,8 @@ bs_dev_destroy(void *io_device)
 	 */
 	bs_call_cpl(&bs->unload_cpl, bs->unload_err);
 
+	bs_mem_factory_destroy(bs);
+
 	free(bs);
 }
 
@@ -4818,23 +4995,32 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 				sizeof(struct spdk_bs_channel), "blobstore");
 	rc = bs_register_md_thread(bs);
 	if (rc == -1) {
-		spdk_io_device_unregister(bs, NULL);
-		pthread_mutex_destroy(&bs->used_clusters_mutex);
-		spdk_bit_array_free(&bs->open_blobids);
-		spdk_bit_array_free(&bs->used_blobids);
-		spdk_bit_array_free(&bs->used_md_pages);
-		spdk_bit_array_free(&ctx->used_clusters);
-		spdk_bit_array_free(&bs->valid_slices);
-		spdk_free(ctx->super);
-		free(ctx);
-		free(bs);
-		/* FIXME: this is a lie but don't know how to get a proper error code here */
-		return -ENOMEM;
+		goto exit;
+	}
+
+	rc = bs_mem_factory_init(bs);
+	if (rc != 0) {
+		goto exit;
 	}
 
 	*_ctx = ctx;
 	*_bs = bs;
 	return 0;
+
+exit:
+	spdk_io_device_unregister(bs, NULL);
+	pthread_mutex_destroy(&bs->used_clusters_mutex);
+	spdk_bit_array_free(&bs->open_blobids);
+	spdk_bit_array_free(&bs->used_blobids);
+	spdk_bit_array_free(&bs->used_md_pages);
+	spdk_bit_array_free(&ctx->used_clusters);
+	spdk_bit_array_free(&bs->valid_slices);
+	spdk_free(ctx->super);
+	free(ctx);
+	bs_mem_factory_destroy(bs);
+	free(bs);
+	/* FIXME: this is a lie but don't know how to get a proper error code here */
+	return -ENOMEM;
 }
 
 static void
@@ -9424,8 +9610,6 @@ blob_io_statistics*
 spdk_bs_get_io_statistics(struct spdk_blob_store *bs, enum bs_io_type type)
 {
 	switch (type) {
-		case NORMAL:
-			return &bs->normal;
 		case COW:
 			return &bs->slice;
 		case MAPPING:
