@@ -59,6 +59,8 @@
 #define BS_PAGE_MEM_POOL_SIZE 1024
 #define BS_SLICE_MEM_POOL_SIZE 512
 #define BS_MERGE_MEM_POOL_SIZE 512
+#define CLUSTER_REF_SHIFT (CHAR_BIT * (sizeof(uint32_t)-1))
+#define CLUSTER_REF_MASK (255 << CLUSTER_REF_SHIFT)
 
 struct cow_sequencer;
 struct mapping_sequencer;
@@ -204,6 +206,8 @@ struct spdk_blob_mut_data {
 	 * the order of the metadata page sequence.
 	 */
 	uint32_t	*pages;
+
+	uint8_t *ref_cnt;
 };
 
 enum spdk_blob_state {
