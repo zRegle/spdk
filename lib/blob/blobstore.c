@@ -5666,6 +5666,7 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 			uint32_t					cluster_count = 0;
 			uint32_t					cluster_idx;
 			size_t						cluster_idx_length;
+			uint32_t					data;
 
 			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
 			cluster_idx_length = desc_extent->length - sizeof(desc_extent->start_cluster_idx);
@@ -5676,7 +5677,8 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 			}
 
 			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
-				cluster_idx = desc_extent->cluster_idx[i];
+				data = desc_extent->cluster_idx[i];
+				cluster_idx = data & ~CLUSTER_REF_MASK;
 				/*
 				 * cluster_idx = 0 means an unallocated cluster - don't mark that
 				 * in the used cluster map.
