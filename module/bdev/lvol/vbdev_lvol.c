@@ -606,6 +606,35 @@ _vbdev_lvol_destroy_cb(void *cb_arg, int bdeverrno)
 	free(ctx);
 }
 
+static void
+_vbdev_lvol_hide_snapshot_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("Renaming lvol failed\n");
+	}
+
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+void
+vbdev_lvol_hide_snapshot(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	spdk_lvol_hide(lvol, _vbdev_lvol_hide_snapshot_cb, req);
+}
+
 void
 vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -618,9 +647,8 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 	/* Check if it is possible to delete lvol */
 	spdk_blob_get_clones(lvol->lvol_store->blobstore, lvol->blob_id, NULL, &count);
 	if (count > 1) {
-		/* throw an error */
-		SPDK_ERRLOG("Cannot delete lvol\n");
-		cb_fn(cb_arg, -EPERM);
+		/* clone greater than one, hide snapshot */
+		vbdev_lvol_hide_snapshot(lvol, cb_fn, cb_arg);
 		return;
 	}
 

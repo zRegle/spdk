@@ -115,6 +115,7 @@ struct spdk_lvol {
 	int				ref_count;
 	bool				action_in_progress;
 	enum blob_clear_method		clear_method;
+	bool	hidden;
 	TAILQ_ENTRY(spdk_lvol) link;
 };
 

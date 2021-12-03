@@ -77,6 +77,8 @@ blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint6
 				 uint64_t *lba,	uint32_t *lba_count);
 static struct spdk_blob *
 blob_lookup(struct spdk_blob_store *bs, spdk_blob_id blobid);
+static void
+blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 #define SLICES_PER_PAGE (SPDK_BS_PAGE_SIZE * CHAR_BIT)
 #define SLICE_MASK_HEADER (sizeof(struct spdk_bs_md_mask) * CHAR_BIT)
@@ -108,6 +110,133 @@ blob_io_ctx_statistics(struct timespec *start, bool is_end)
 	}
 }
 #endif
+
+static int
+bs_reclaim_cluster_poll(void *arg)
+{
+
+}
+
+static void
+bs_reclaim_cluster_queues_destroy(struct spdk_blob_store *bs)
+{
+	uint8_t i;
+	struct cluster_to_reclaim *node, *tnode;
+
+	for (i = 0; i < QUEUE_CNT; i++) {
+		TAILQ_FOREACH_FROM_SAFE(node, &bs->queues[i]->list, link, tnode) {
+			TAILQ_REMOVE(&bs->queues[i]->list, node, link);
+			free(node);
+		}
+		free(bs->queues[i]);
+	}
+}
+
+static int
+bs_reclaim_cluster_queues_init(struct spdk_blob_store *bs)
+{
+	uint8_t i;
+	int rc;
+
+	for (i = 0; i < QUEUE_CNT; i++) {
+		bs->queues[i] = calloc(1, sizeof(cluster_queue));
+		if (bs->queues[i] == NULL) {
+			goto exit;
+		}
+		TAILQ_INIT(&bs->queues[i]->list);
+	}
+
+	return 0;
+
+exit:
+	for (i = 0; i < QUEUE_CNT; i++) {
+		if (bs->queues[i]) {
+			free(bs->queues[i]);
+		}
+	}
+	return -ENOMEM;
+}
+
+static int
+bs_init_background_reclaim(struct spdk_blob_store *bs)
+{
+	int rc;
+
+	rc = bs_reclaim_cluster_queues_init(bs);
+	if (rc != 0) {
+		return rc;
+	}
+
+	bs->reclaim_poller = SPDK_POLLER_REGISTER(bs_reclaim_cluster_poll, bs, 60 * 60 * 1000);
+	if (bs->reclaim_poller == NULL) {
+		bs_reclaim_cluster_queues_destroy(bs);
+		return -1;
+	}
+
+	return 0;
+}
+
+
+void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_store *bs = blob->bs;
+	struct cluster_to_reclaim *node;
+	static bool first = true;
+	uint32_t cluster_ref;
+	uint64_t i, j;
+	int rc;
+
+	assert(blob->md_ro == true);
+
+	/* temporaily unset read-only */
+	blob->md_ro = false;
+
+	rc = blob_set_xattr(blob, "SNAPHID", "true", strlen("true"), true);
+	if (rc < 0) {
+		goto exit;
+	}
+
+	blob->md_ro = true;
+
+	if (first) {
+		rc = bs_init_background_reclaim(bs);
+		if (rc < 0) {
+			goto exit;
+		}
+	}
+
+	for (i = 0; i < blob->active.num_clusters; i++) {
+		cluster_ref = blob->active.ref_cnt[i];
+		assert(cluster_ref >= 0);
+
+		node = calloc(1, sizeof(*node));
+		if (node == NULL) {
+			rc = -ENOMEM;
+			goto exit;
+		}
+		node->blob = blob;
+		node->cluster_idx = i;
+
+		for (j = 0; j < QUEUE_CNT; j++) {
+			if (cluster_ref < bs->queues[j]->upper_bound) {
+				TAILQ_INSERT_TAIL(&bs->queues[j]->list, node, link);
+				break;
+			}
+		}
+		if (cluster_ref > HIGH_UPPER_BOUND) {
+			TAILQ_INSERT_TAIL(&bs->queues[SUPER_HIGH]->list, node, link);
+		}
+	}
+
+	blob_sync_md(blob, cb_fn, cb_arg);
+
+	return;
+
+exit:
+	blob->md_ro = true;
+	blob_remove_xattr(blob, "SNAPHID", true);
+	cb_fn(cb_arg, rc);
+}
 
 static inline uint32_t
 bs_mem_buf_getsz(struct spdk_blob_store *bs, enum buf_type type)

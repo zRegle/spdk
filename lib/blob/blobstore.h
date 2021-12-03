@@ -61,6 +61,12 @@
 #define BS_MERGE_MEM_POOL_SIZE 512
 #define CLUSTER_REF_SHIFT (CHAR_BIT * (sizeof(uint32_t)-1))
 #define CLUSTER_REF_MASK (255 << CLUSTER_REF_SHIFT)
+#define QUEUE_CNT 5
+
+#define SUPER_LOW_UPPER_BOUND 1024
+#define LOW_UPPER_BOUND (4 * 1024)
+#define MEDIUM_UPPER_BOUND (8 * 1024)
+#define HIGH_UPPER_BOUND (16 * 1024)
 
 struct cow_sequencer;
 struct mapping_sequencer;
@@ -161,6 +167,26 @@ typedef struct {
 	TAILQ_HEAD(, blob_io_buf) slice_pool;
 	TAILQ_HEAD(, blob_io_buf) merge_pool;
 } mem_pool_factory;
+
+struct cluster_to_reclaim {
+	struct spdk_blob *blob;
+	uint64_t cluster_idx;
+	TAILQ_ENTRY(cluster_to_reclaim) link;
+};
+
+typedef struct {
+	uint32_t lower_bound;
+	uint32_t upper_bound;
+	TAILQ_HEAD(, cluster_to_reclaim) list;
+} cluster_queue;
+
+enum queue_priority {
+	SUPER_HIGH = 0,
+	HIGH = 1,
+	MEDIUM = 2,
+	LOW = 3,
+	SUPER_LOW = 4
+};
 
 struct spdk_xattr {
 	uint32_t	index;
@@ -338,6 +364,8 @@ struct spdk_blob_store {
 	bool                            clean;
 
 	mem_pool_factory	*factory;
+	cluster_queue *queues[QUEUE_CNT];
+	struct spdk_poller *reclaim_poller;
 #ifdef DEBUG
 	blob_io_statistics slice;
 	blob_io_statistics cluster;

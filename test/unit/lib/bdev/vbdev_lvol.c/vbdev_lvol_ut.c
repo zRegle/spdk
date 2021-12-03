@@ -464,6 +464,8 @@ spdk_lvol_deletable(struct spdk_lvol *lvol)
 	return true;
 }
 
+void spdk_lvol_hide(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg) {}
+
 void
 spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {

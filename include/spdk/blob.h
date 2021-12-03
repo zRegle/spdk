@@ -993,6 +993,7 @@ struct spdk_bs_mask_info {
 };
 void spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **info,
 				enum bs_mask_type type, int *bserrno);
+void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 #ifdef __cplusplus
 }
 #endif
