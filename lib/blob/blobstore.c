@@ -111,133 +111,7 @@ blob_io_ctx_statistics(struct timespec *start, bool is_end)
 }
 #endif
 
-static int
-bs_reclaim_cluster_poll(void *arg)
-{
-
-}
-
-static void
-bs_reclaim_cluster_queues_destroy(struct spdk_blob_store *bs)
-{
-	uint8_t i;
-	struct cluster_to_reclaim *node, *tnode;
-
-	for (i = 0; i < QUEUE_CNT; i++) {
-		TAILQ_FOREACH_FROM_SAFE(node, &bs->queues[i]->list, link, tnode) {
-			TAILQ_REMOVE(&bs->queues[i]->list, node, link);
-			free(node);
-		}
-		free(bs->queues[i]);
-	}
-}
-
-static int
-bs_reclaim_cluster_queues_init(struct spdk_blob_store *bs)
-{
-	uint8_t i;
-	int rc;
-
-	for (i = 0; i < QUEUE_CNT; i++) {
-		bs->queues[i] = calloc(1, sizeof(cluster_queue));
-		if (bs->queues[i] == NULL) {
-			goto exit;
-		}
-		TAILQ_INIT(&bs->queues[i]->list);
-	}
-
-	return 0;
-
-exit:
-	for (i = 0; i < QUEUE_CNT; i++) {
-		if (bs->queues[i]) {
-			free(bs->queues[i]);
-		}
-	}
-	return -ENOMEM;
-}
-
-static int
-bs_init_background_reclaim(struct spdk_blob_store *bs)
-{
-	int rc;
-
-	rc = bs_reclaim_cluster_queues_init(bs);
-	if (rc != 0) {
-		return rc;
-	}
-
-	bs->reclaim_poller = SPDK_POLLER_REGISTER(bs_reclaim_cluster_poll, bs, 60 * 60 * 1000);
-	if (bs->reclaim_poller == NULL) {
-		bs_reclaim_cluster_queues_destroy(bs);
-		return -1;
-	}
-
-	return 0;
-}
-
-
-void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
-{
-	struct spdk_blob_store *bs = blob->bs;
-	struct cluster_to_reclaim *node;
-	static bool first = true;
-	uint32_t cluster_ref;
-	uint64_t i, j;
-	int rc;
-
-	assert(blob->md_ro == true);
-
-	/* temporaily unset read-only */
-	blob->md_ro = false;
-
-	rc = blob_set_xattr(blob, "SNAPHID", "true", strlen("true"), true);
-	if (rc < 0) {
-		goto exit;
-	}
-
-	blob->md_ro = true;
-
-	if (first) {
-		rc = bs_init_background_reclaim(bs);
-		if (rc < 0) {
-			goto exit;
-		}
-	}
-
-	for (i = 0; i < blob->active.num_clusters; i++) {
-		cluster_ref = blob->active.ref_cnt[i];
-		assert(cluster_ref >= 0);
-
-		node = calloc(1, sizeof(*node));
-		if (node == NULL) {
-			rc = -ENOMEM;
-			goto exit;
-		}
-		node->blob = blob;
-		node->cluster_idx = i;
-
-		for (j = 0; j < QUEUE_CNT; j++) {
-			if (cluster_ref < bs->queues[j]->upper_bound) {
-				TAILQ_INSERT_TAIL(&bs->queues[j]->list, node, link);
-				break;
-			}
-		}
-		if (cluster_ref > HIGH_UPPER_BOUND) {
-			TAILQ_INSERT_TAIL(&bs->queues[SUPER_HIGH]->list, node, link);
-		}
-	}
-
-	blob_sync_md(blob, cb_fn, cb_arg);
-
-	return;
-
-exit:
-	blob->md_ro = true;
-	blob_remove_xattr(blob, "SNAPHID", true);
-	cb_fn(cb_arg, rc);
-}
-
+/* START OF MEM POOL */
 static inline uint32_t
 bs_mem_buf_getsz(struct spdk_blob_store *bs, enum buf_type type)
 {
@@ -431,7 +305,9 @@ bs_mem_factory_put(struct spdk_blob_store *bs, struct blob_io_buf *ele)
 
 	TAILQ_INSERT_TAIL(queue, ele, link);
 }
+/* END OF MEM POOL */
 
+/* START OF SLICE FUNCTIONS */
 static void
 bs_set_slice(struct spdk_blob_store *bs, uint64_t slice)
 {
@@ -492,182 +368,6 @@ bs_lba_to_slice(struct spdk_blob_store *bs, uint64_t lba)
 	assert(lba % (bs->slice_sz / bs->dev->blocklen) == 0);
 
 	return lba / (bs->slice_sz / bs->dev->blocklen);
-}
-
-static void
-blob_serialize_slice_page(const struct spdk_blob *blob, 
-			uint64_t slice, void *payload)
-{
-	struct spdk_blob_store *bs = blob->bs;
-	struct spdk_bs_md_mask *mask;
-	uint32_t md_page, first_page_data_bytes;
-	uint64_t bias;
-
-	md_page = bs_slice_to_md_page(bs, slice);
-	first_page_data_bytes = SPDK_BS_PAGE_SIZE - sizeof(struct spdk_bs_md_mask);
-
-	if (!md_page) {
-		mask = (struct spdk_bs_md_mask *)payload;
-		mask->type = SPDK_MD_MASK_TYPE_VALID_SLICES;
-		mask->length = bs->total_slices;
-		memcpy(mask->mask, bs->valid_slices->words, first_page_data_bytes);
-	} else {
-		bias = (md_page - 1) * SPDK_BS_PAGE_SIZE + first_page_data_bytes;
-		/* 'bias' is measured in bytes, 'bs->valid_slices->words' is uint64_t
-		 * convert it first */
-		memcpy(payload, (uint8_t*)bs->valid_slices->words + bias, SPDK_BS_PAGE_SIZE);
-	}
-}
-
-void 
-spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **info,
-				enum bs_mask_type type, int *bserrno)
-{
-	struct spdk_bs_mask_info *_info;
-	const uint8_t mask_word_bytes = sizeof(uint64_t); 
-	struct spdk_bit_array *array = NULL;
-	uint64_t bytes_count;
-
-	_info = calloc(1, sizeof(*_info));
-	if (_info == NULL) {
-		SPDK_ERRLOG("malloc failed\n");
-		*bserrno = -ENOMEM;
-		goto cleanup;
-	}
-
-	switch (type) {
-		case BS_VALID_SLICES:
-			array = bs->valid_slices;
-			bytes_count = spdk_divide_round_up(bs->total_slices, mask_word_bytes);
-			break;
-		case BS_USED_CLUSTERS:
-			bytes_count = spdk_divide_round_up(bs->total_clusters, mask_word_bytes);
-			//TODO: cluster bit array;
-			break;
-		case BS_USED_MD_PAGE:
-			array = bs->used_md_pages;
-			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
-			break;
-		case BS_USED_BLOBIDS:
-			array = bs->used_blobids;
-			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
-			break;
-		case BS_OPEN_BLOBIDS:
-			array = bs->open_blobids;
-			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
-			break;
-		default:
-			SPDK_ERRLOG("invalid mask type, %d\n", type);
-			*bserrno = -EINVAL;
-			goto cleanup;
-	}
-
-	_info->mask = malloc(bytes_count);
-	if (_info->mask == NULL) {
-		SPDK_ERRLOG("malloc failed\n");
-		*bserrno = -ENOMEM;
-		goto cleanup;
-	}
-	_info->count = bytes_count / mask_word_bytes;
-
-	memset(_info->mask, 0, bytes_count);
-	memcpy(_info->mask, array->words, bytes_count);
-
-	*info = _info;
-	*bserrno = 0;
-	
-	return;
-
-cleanup:
-	if (_info) {
-		if (_info->mask)
-			free(_info->mask);
-		free(_info);
-	}
-}
-
-static struct cow_sequencer*
-blob_get_cow_sequencer(struct rb_root *root, uint64_t slice)
-{
-	struct rb_node **node = &(root->rb_node), *parent = NULL;
-	struct cow_sequencer *this = NULL;
-
-	while (*node) {
-		this = container_of(*node, struct cow_sequencer, node);
-		parent = *node;
-		if (this->slice > slice)
-			node = &((*node)->rb_left);
-		else if (this->slice < slice)
-			node = &((*node)->rb_right);
-		else
-			return this;
-	}
-
-	/* not found, create a new sequencer */
-	this = calloc(1, sizeof(*this));
-	if (!this) {
-		SPDK_ERRLOG("calloc failed\n");
-		return this;
-	}
-	this->slice = slice;
-	TAILQ_INIT(&this->pending_ios);
-
-	/* Add new node and rebalance tree. */
-	rb_link_node(&this->node, parent, node);
-	rb_insert_color(&this->node, root);
-
-	return this;
-}
-
-static void
-blob_delete_cow_sequencer(struct rb_root *root, struct cow_sequencer *sequencer)
-{
-	assert(sequencer != NULL);
-	/* remove from rbtree */
-	rb_erase(&sequencer->node, root);
-	free(sequencer);
-}
-
-static struct mapping_sequencer*
-blob_get_mapping_sequencer(struct rb_root *root, uint64_t cluster)
-{
-	struct rb_node **node = &(root->rb_node), *parent = NULL;
-	struct mapping_sequencer *this = NULL;
-
-	while (*node) {
-		this = container_of(*node, struct mapping_sequencer, node);
-		parent = *node;
-		if (this->cluster > cluster)
-			node = &((*node)->rb_left);
-		else if (this->cluster < cluster)
-			node = &((*node)->rb_right);
-		else
-			return this;
-	}
-
-	/* not found, create a new sequencer */
-	this = calloc(1, sizeof(*this));
-	if (!this) {
-		SPDK_ERRLOG("calloc failed\n");
-		return this;
-	}
-	this->cluster = cluster;
-	TAILQ_INIT(&this->pending_ios);
-
-	/* Add new node and rebalance tree. */
-	rb_link_node(&this->node, parent, node);
-	rb_insert_color(&this->node, root);
-
-	return this;
-}
-
-static void
-blob_delete_mapping_sequencer(struct rb_root *root, struct mapping_sequencer *sequencer)
-{
-	assert(sequencer != NULL);
-	/* remove from rbtree */
-	rb_erase(&sequencer->node, root);
-	free(sequencer);
 }
 
 /* Given an cluster into a blobstore, look up the slice into blobstore
@@ -766,6 +466,185 @@ bs_io_unit_to_slice_start(struct spdk_blob *blob, uint64_t io_unit)
 
 	return page - (page % pages_per_slice);
 }
+/* END OF SLICE FUNCTIONS */
+
+static void
+blob_serialize_slice_page(const struct spdk_blob *blob, 
+			uint64_t slice, void *payload)
+{
+	struct spdk_blob_store *bs = blob->bs;
+	struct spdk_bs_md_mask *mask;
+	uint32_t md_page, first_page_data_bytes;
+	uint64_t bias;
+
+	md_page = bs_slice_to_md_page(bs, slice);
+	first_page_data_bytes = SPDK_BS_PAGE_SIZE - sizeof(struct spdk_bs_md_mask);
+
+	if (!md_page) {
+		mask = (struct spdk_bs_md_mask *)payload;
+		mask->type = SPDK_MD_MASK_TYPE_VALID_SLICES;
+		mask->length = bs->total_slices;
+		memcpy(mask->mask, bs->valid_slices->words, first_page_data_bytes);
+	} else {
+		bias = (md_page - 1) * SPDK_BS_PAGE_SIZE + first_page_data_bytes;
+		/* 'bias' is measured in bytes, 'bs->valid_slices->words' is uint64_t
+		 * convert it first */
+		memcpy(payload, (uint8_t*)bs->valid_slices->words + bias, SPDK_BS_PAGE_SIZE);
+	}
+}
+
+void 
+spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **info,
+				enum bs_mask_type type, int *bserrno)
+{
+	struct spdk_bs_mask_info *_info;
+	const uint8_t mask_word_bytes = sizeof(uint64_t); 
+	struct spdk_bit_array *array = NULL;
+	uint64_t bytes_count;
+
+	_info = calloc(1, sizeof(*_info));
+	if (_info == NULL) {
+		SPDK_ERRLOG("malloc failed\n");
+		*bserrno = -ENOMEM;
+		goto cleanup;
+	}
+
+	switch (type) {
+		case BS_VALID_SLICES:
+			array = bs->valid_slices;
+			bytes_count = spdk_divide_round_up(bs->total_slices, mask_word_bytes);
+			break;
+		case BS_USED_CLUSTERS:
+			bytes_count = spdk_divide_round_up(bs->total_clusters, mask_word_bytes);
+			//TODO: cluster bit array;
+			break;
+		case BS_USED_MD_PAGE:
+			array = bs->used_md_pages;
+			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
+			break;
+		case BS_USED_BLOBIDS:
+			array = bs->used_blobids;
+			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
+			break;
+		case BS_OPEN_BLOBIDS:
+			array = bs->open_blobids;
+			bytes_count = spdk_divide_round_up(bs->md_len, mask_word_bytes);
+			break;
+		default:
+			SPDK_ERRLOG("invalid mask type, %d\n", type);
+			*bserrno = -EINVAL;
+			goto cleanup;
+	}
+
+	_info->mask = malloc(bytes_count);
+	if (_info->mask == NULL) {
+		SPDK_ERRLOG("malloc failed\n");
+		*bserrno = -ENOMEM;
+		goto cleanup;
+	}
+	_info->count = bytes_count / mask_word_bytes;
+
+	memset(_info->mask, 0, bytes_count);
+	memcpy(_info->mask, array->words, bytes_count);
+
+	*info = _info;
+	*bserrno = 0;
+	
+	return;
+
+cleanup:
+	if (_info) {
+		if (_info->mask)
+			free(_info->mask);
+		free(_info);
+	}
+}
+
+/* START OF SEQUENCER API */
+static struct cow_sequencer*
+blob_get_cow_sequencer(struct rb_root *root, uint64_t slice)
+{
+	struct rb_node **node = &(root->rb_node), *parent = NULL;
+	struct cow_sequencer *this = NULL;
+
+	while (*node) {
+		this = container_of(*node, struct cow_sequencer, node);
+		parent = *node;
+		if (this->slice > slice)
+			node = &((*node)->rb_left);
+		else if (this->slice < slice)
+			node = &((*node)->rb_right);
+		else
+			return this;
+	}
+
+	/* not found, create a new sequencer */
+	this = calloc(1, sizeof(*this));
+	if (!this) {
+		SPDK_ERRLOG("calloc failed\n");
+		return this;
+	}
+	this->slice = slice;
+	TAILQ_INIT(&this->pending_ios);
+
+	/* Add new node and rebalance tree. */
+	rb_link_node(&this->node, parent, node);
+	rb_insert_color(&this->node, root);
+
+	return this;
+}
+
+static void
+blob_delete_cow_sequencer(struct rb_root *root, struct cow_sequencer *sequencer)
+{
+	assert(sequencer != NULL);
+	/* remove from rbtree */
+	rb_erase(&sequencer->node, root);
+	free(sequencer);
+}
+
+static struct mapping_sequencer*
+blob_get_mapping_sequencer(struct rb_root *root, uint64_t cluster)
+{
+	struct rb_node **node = &(root->rb_node), *parent = NULL;
+	struct mapping_sequencer *this = NULL;
+
+	while (*node) {
+		this = container_of(*node, struct mapping_sequencer, node);
+		parent = *node;
+		if (this->cluster > cluster)
+			node = &((*node)->rb_left);
+		else if (this->cluster < cluster)
+			node = &((*node)->rb_right);
+		else
+			return this;
+	}
+
+	/* not found, create a new sequencer */
+	this = calloc(1, sizeof(*this));
+	if (!this) {
+		SPDK_ERRLOG("calloc failed\n");
+		return this;
+	}
+	this->cluster = cluster;
+	TAILQ_INIT(&this->pending_ios);
+
+	/* Add new node and rebalance tree. */
+	rb_link_node(&this->node, parent, node);
+	rb_insert_color(&this->node, root);
+
+	return this;
+}
+
+static void
+blob_delete_mapping_sequencer(struct rb_root *root, struct mapping_sequencer *sequencer)
+{
+	assert(sequencer != NULL);
+	/* remove from rbtree */
+	rb_erase(&sequencer->node, root);
+	free(sequencer);
+}
+/* END OF SEQUENCER API */
 
 static struct cow_sequencer*
 blob_get_slice_mask(struct spdk_blob *blob, uint64_t offset, enum slice_status *mask, bool read)
