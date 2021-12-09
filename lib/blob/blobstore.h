@@ -171,6 +171,8 @@ typedef struct {
 struct cluster_to_reclaim {
 	struct spdk_blob *blob;
 	uint64_t cluster_idx;
+	spdk_blob_id last_child; /* clone that copy data to last time */
+	bool on_process;
 	TAILQ_ENTRY(cluster_to_reclaim) link;
 };
 
@@ -180,12 +182,12 @@ typedef struct {
 	TAILQ_HEAD(, cluster_to_reclaim) list;
 } cluster_queue;
 
-enum queue_priority {
-	SUPER_HIGH = 0,
-	HIGH = 1,
+enum copy_workload {
+	SUPER_LOW = 0,
+	LOW = 1,
 	MEDIUM = 2,
-	LOW = 3,
-	SUPER_LOW = 4
+	HIGH = 3,
+	SUPER_HIGH = 4
 };
 
 struct spdk_xattr {

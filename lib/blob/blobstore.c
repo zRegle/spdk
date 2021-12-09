@@ -75,15 +75,15 @@ static void blob_prepare_io(struct blob_io_ctx *ctx);
 static inline bool
 blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint64_t length,
 				 uint64_t *lba,	uint32_t *lba_count);
-static struct spdk_blob *
-blob_lookup(struct spdk_blob_store *bs, spdk_blob_id blobid);
-static void
-blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+static struct spdk_blob* blob_lookup(struct spdk_blob_store *bs, spdk_blob_id blobid);
+static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 #define SLICES_PER_PAGE (SPDK_BS_PAGE_SIZE * CHAR_BIT)
 #define SLICE_MASK_HEADER (sizeof(struct spdk_bs_md_mask) * CHAR_BIT)
 #define BWRAID_VOLUME_MIN_SIZE (1ULL << 30)
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
+#define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
+#define RECLAIM_POLL_INTERVAL (60 * 60 * 1000)
 
 enum slice_status {
 	ERROR = -2,
@@ -465,6 +465,14 @@ bs_io_unit_to_slice_start(struct spdk_blob *blob, uint64_t io_unit)
 	page = bs_io_unit_to_page(blob->bs, io_unit);
 
 	return page - (page % pages_per_slice);
+}
+
+static inline bool
+blob_logic_slice_is_valid(struct spdk_blob *blob, uint64_t logic_slice)
+{
+	uint64_t phy_slice = bs_logic_slice_to_physical(blob, logic_slice);
+
+	return bs_slice_is_valid(blob->bs, phy_slice);
 }
 /* END OF SLICE FUNCTIONS */
 
@@ -1675,6 +1683,512 @@ cleanup:
 	blob_free_io_ctx(ctx);
 	cb_fn(cb_arg, rc);
 }
+
+/* START OF CLUSTER RECLAIM */
+typedef struct {
+	uint8_t queue_idx;
+	struct cluster_to_reclaim *current;
+	uint64_t data_copied;
+	/* data that try to copy in current iteration */
+	uint64_t cur_try_copy;
+	uint32_t outstanding_ops;
+} reclaim_cluster_ctx;
+
+typedef struct {
+	struct spdk_blob *clone;
+	uint64_t offset;
+	uint64_t length;
+	struct iovec *iov;
+	int iovcnt;
+	spdk_bs_sequence_t *seq;
+	struct cow_sequencer **sequencers;
+} touch_cluster_ctx;
+
+static inline void
+free_touch_cluster_ctx(touch_cluster_ctx *ctx)
+{
+	if (ctx != NULL) {
+		if (ctx->iov != NULL) {
+			if (ctx->iov->iov_base != NULL) {
+				spdk_free(ctx->iov->iov_base);
+			}
+			free(ctx->iov);
+		}
+		free(ctx);
+	}
+}
+
+static void bs_reclaim_cluster_iter(reclaim_cluster_ctx *ctx, int bserrno);
+
+static void
+blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
+{
+	reclaim_cluster_ctx *ctx = cb_arg;
+
+	assert(ctx->outstanding_ops > 0);
+	ctx->outstanding_ops--;
+
+	if (ctx->outstanding_ops == 0) {
+		if (bserrno == 0) {
+			ctx->data_copied += ctx->cur_try_copy;
+			ctx->cur_try_copy = 0;
+			if (ctx->data_copied >= DATA_COPY_THRESHOLD) {
+				/* copy enough data, wait for next poll */
+				ctx->current->on_process = false;
+				free(ctx);
+				return;
+			}
+		}
+		bs_reclaim_cluster_iter(ctx, bserrno);
+	}
+}
+
+static void
+blob_touch_cluster_write_cpl(void *cb_arg, int bserrno)
+{
+	touch_cluster_ctx *ctx = cb_arg;
+
+	bs_sequence_finish(ctx->seq, bserrno);
+	free_touch_cluster_ctx(ctx);
+}
+
+static void
+blob_touch_cluster_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	touch_cluster_ctx *ctx = cb_arg;
+	struct spdk_blob *clone = ctx->clone;
+	struct spdk_io_channel *channel;
+	uint32_t i, count;
+
+	if (bserrno != 0) {
+		bs_sequence_finish(seq, bserrno);
+		free_touch_cluster_ctx(ctx);
+		return;
+	}
+	
+	channel = spdk_bs_alloc_io_channel(ctx->clone->bs);
+	assert(channel != NULL);
+
+	count = ctx->length * clone->bs->io_unit_size / clone->bs->slice_sz;
+	assert(count > 0);
+	for (i = 0; i < count; i++) {
+		assert(ctx->sequencers[i]->read_count > 0);
+		/* read finish, read count minus one */
+		ctx->sequencers[i]->read_count--;
+	} 
+
+	blob_start_io(clone, channel, ctx->iov, ctx->iovcnt,
+				ctx->offset, ctx->length, blob_touch_cluster_write_cpl, ctx, false);
+}
+
+static void
+blob_touch_cluster_copy(uint64_t start_slice, uint32_t count, 
+				struct spdk_blob *clone, reclaim_cluster_ctx *ctx)
+{
+	struct spdk_blob_store *bs = clone->bs;
+	touch_cluster_ctx *tctx = NULL;
+	struct iovec *iov;
+	struct spdk_bs_cpl cpl;
+	struct spdk_io_channel *channel;
+	uint32_t i;
+	int rc = 0;
+
+	tctx = calloc(1, sizeof(*tctx));
+	if (tctx == NULL) {
+		rc = -ENOMEM;
+		goto exit;
+	}
+	tctx->clone = clone;
+	tctx->offset = start_slice * bs->slice_sz / bs->io_unit_size;
+	tctx->length = count * bs->slice_sz / bs->io_unit_size;
+
+	tctx->iov = calloc(1, sizeof(*tctx->iov));
+	if (tctx->iov == NULL) {
+		rc = -ENOMEM;
+		goto exit;
+	}
+	tctx->iovcnt = 1;
+
+	iov = tctx->iov;
+	iov->iov_len = count * bs->slice_sz;
+	iov->iov_base = spdk_malloc(iov->iov_len, 0, NULL, 
+				SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (iov->iov_base == NULL) {
+		rc = -ENOMEM;
+		goto exit;
+	}
+
+	tctx->sequencers = calloc(count, sizeof(*tctx->sequencers));
+	if (tctx->sequencers == NULL) {
+		rc = -ENOMEM;
+		goto exit;
+	}
+
+	/* check whether it's suitable to copy */
+	for (i = 0; i < count; i++) {
+		tctx->sequencers[i] = blob_get_cow_sequencer(&clone->slice_sequencers_tree, start_slice + i);
+		assert(tctx->sequencers[i] != NULL);
+		if (tctx->sequencers[i]->cow_io) {
+			/* cow active, just wait for the next time */
+			rc = -EBUSY;
+			goto exit;
+		}
+		/* read count plus one, block cow */
+		tctx->sequencers[i]->read_count++;
+	}
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	if (channel == NULL) {
+		rc = -ENOMEM;
+		goto exit;
+	}
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = blob_touch_cluster_copy_cpl;
+	cpl.u.blob_basic.cb_arg = ctx;
+
+	tctx->seq = bs_sequence_start(channel, &cpl);
+	if (tctx->seq == NULL) {
+		rc = -ENOMEM;
+		goto exit;		
+	}
+
+	bs_sequence_readv_bs_dev(tctx->seq, clone->back_bs_dev, iov, tctx->iovcnt,
+				bs_io_unit_to_back_dev_lba(clone, tctx->offset),
+				bs_io_unit_to_back_dev_lba(clone, tctx->length), 
+				blob_touch_cluster_write_copy, tctx);
+	/* TODO: try_copy may failed, actual copied data may get wrong */
+	ctx->cur_try_copy += tctx->length;
+
+	return;
+
+exit:
+	free_touch_cluster_ctx(tctx);
+	bs_reclaim_cluster_iter(ctx, rc);
+}
+
+static void
+blob_touch_clone_cluster(struct spdk_blob *clone, reclaim_cluster_ctx *ctx)
+{
+	struct cluster_to_reclaim *target = ctx->current;
+	struct spdk_blob *snap = target->blob;
+	struct spdk_blob_store *bs = snap->bs;
+	uint64_t cluster = target->cluster_idx;
+	uint64_t start_slice; /* track copy range */
+	uint64_t base_slice; /* track whether slice is valid */
+	uint32_t idx, cnt = 0;
+	/* indicate if there is any previous copy process */
+	bool first = true;
+	int rc;
+
+	if (clone->active.clusters[cluster] == 0) {
+		/* cluster of this clone not allcoated
+		 * copy data is worthless, skip this clone */
+		goto next;
+	}
+
+	start_slice = base_slice = cluster * bs->slices_per_cluster;
+	for (idx = 0; idx < bs->slices_per_cluster; idx++) {
+		if (blob_logic_slice_is_valid(clone, base_slice + idx)) {
+			if (!first) {
+				blob_touch_cluster_copy(start_slice, cnt, clone, ctx);
+				ctx->outstanding_ops++;
+			}
+			start_slice = base_slice + idx + 1;
+			cnt = 0;
+		} else {
+			first = false;
+			cnt++;
+			if (cnt * bs->slice_sz >= DATA_COPY_THRESHOLD) {
+				/* copied enough data */
+				break;
+			}
+		}
+	}
+
+	if (cnt != 0) {
+		/* copy the rest slices */
+		blob_touch_cluster_copy(start_slice, cnt, clone, ctx);
+		ctx->outstanding_ops++;
+		return;
+	}
+
+	/* slices of this cluster in this clone are all valid
+	no need to copy data, move to next iteration */
+next:
+	bs_reclaim_cluster_iter(ctx, 0);
+}
+
+static struct cluster_to_reclaim*
+bs_reclaim_cluster_get_next(reclaim_cluster_ctx *ctx, struct spdk_blob_store *bs)
+{
+	struct cluster_to_reclaim *cur = ctx->current, *next = NULL;
+	uint8_t queue_idx;
+
+	if ((next = TAILQ_NEXT(cur, link)) != NULL) {
+		ctx->current = next;
+		ctx->data_copied = 0;
+		return next;
+	}
+
+	queue_idx = ctx->queue_idx + 1; /* move to next queue */
+	for (; queue_idx < QUEUE_CNT; queue_idx++) {
+		if (!TAILQ_EMPTY(&bs->queues[queue_idx]->list)) {
+			next = TAILQ_FIRST(&bs->queues[queue_idx]->list);
+			ctx->queue_idx = queue_idx;
+			ctx->current = next;
+			ctx->data_copied = 0;
+			return next;
+		}
+	}
+
+	return NULL;
+}
+
+static int
+bs_reclaim_cluster_get_next_clone(struct cluster_to_reclaim *target, struct spdk_blob **next)
+{
+	struct spdk_blob *snap = target->blob;
+	spdk_blob_id *ids, next_id;
+	uint32_t i;
+	size_t clone_count = 0;
+	int rc = 0;
+
+	spdk_blob_get_clones(snap->bs, snap->id, NULL, &clone_count);
+
+	if (clone_count <= 1) {
+		/* TODO: delete snapshot */
+		return rc;
+	}
+
+	/* TODO: last_child may have been deleted */
+
+	ids = calloc(clone_count, sizeof(*ids));
+	if (ids == NULL) {
+		SPDK_ERRLOG("No memory\n");
+		rc = -ENOMEM;
+		return rc;
+	}
+
+	spdk_blob_get_clones(snap->bs, snap->id, ids, &clone_count);
+
+	if (target->last_child != SPDK_BLOBID_INVALID) {
+		/* has tried to copy data to previous clones, start from next clone */
+		for (i = 0; i < clone_count; i++) {
+			if (ids[i] == target->last_child) {
+				/* locate last child index */
+				break;
+			}
+		}
+	
+		if (i == clone_count - 1) {
+			/* every clone of this snapshot cluster has tried */
+			target->last_child = SPDK_BLOBID_INVALID; /* reset iter index */
+			return rc;
+		}
+
+		next_id = ids[i+1];
+	} else {
+		next_id = ids[0];
+	}
+
+	*next = blob_lookup(snap->bs, next_id);
+	target->last_child = (*next)->id;
+	assert(next != NULL);
+
+	return rc;
+}
+
+static void
+bs_reclaim_cluster_iter(reclaim_cluster_ctx *ctx, int bserrno)
+{
+	struct cluster_to_reclaim *target = ctx->current;
+	struct spdk_blob *snap = target->blob;
+	struct spdk_blob *clone = NULL;
+	int rc;
+
+	assert(ctx->outstanding_ops == 0);
+
+	if (bserrno != 0) {
+		/* TODO: error hanlde */
+		return;
+	}
+
+	rc = bs_reclaim_cluster_get_next_clone(target, &clone);
+	if (clone == NULL) {
+		/* every clone of this snapshot cluster has tried
+		move on to next cluster */
+		target = bs_reclaim_cluster_get_next(ctx, snap->bs);
+		if (target == NULL) {
+			/* no next cluster, just exit */
+			ctx->current->on_process = false;
+			free(ctx);
+			return;
+		}
+		/* recursive call */
+		bs_reclaim_cluster_iter(ctx, 0);
+		return;
+	}
+
+	blob_touch_clone_cluster(clone, ctx);
+}
+
+static int
+bs_reclaim_cluster_poll(void *arg)
+{
+	struct spdk_blob_store *bs = arg;
+	struct cluster_to_reclaim *target;
+	reclaim_cluster_ctx *ctx;
+	uint8_t i;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("calloc failed\n");
+		return -1;
+	}
+
+	for (i = 0; i < QUEUE_CNT; i++) {
+		TAILQ_FOREACH(target, &bs->queues[i]->list, link) {
+			if (!target->on_process) {
+				ctx->current = target;
+				ctx->queue_idx = i;
+				ctx->data_copied = 0;
+				target->on_process = true;
+				bs_reclaim_cluster_iter(ctx, 0);
+				return SPDK_POLLER_BUSY;
+			}
+		}
+	}
+
+	free(ctx);
+
+	return SPDK_POLLER_IDLE;
+}
+
+static void
+bs_reclaim_cluster_queues_destroy(struct spdk_blob_store *bs)
+{
+	uint8_t i;
+	struct cluster_to_reclaim *node, *tnode;
+
+	for (i = 0; i < QUEUE_CNT; i++) {
+		TAILQ_FOREACH_FROM_SAFE(node, &bs->queues[i]->list, link, tnode) {
+			TAILQ_REMOVE(&bs->queues[i]->list, node, link);
+			free(node);
+		}
+		free(bs->queues[i]);
+	}
+}
+
+static int
+bs_reclaim_cluster_queues_init(struct spdk_blob_store *bs)
+{
+	uint8_t i;
+
+	for (i = 0; i < QUEUE_CNT; i++) {
+		bs->queues[i] = calloc(1, sizeof(cluster_queue));
+		if (bs->queues[i] == NULL) {
+			goto exit;
+		}
+		bs->queues[i]->lower_bound = i;
+		bs->queues[i]->upper_bound = (i + 1) * 2;
+		TAILQ_INIT(&bs->queues[i]->list);
+	}
+
+	return 0;
+
+exit:
+	for (i = 0; i < QUEUE_CNT; i++) {
+		if (bs->queues[i]) {
+			free(bs->queues[i]);
+		}
+	}
+	return -ENOMEM;
+}
+
+static int
+bs_init_background_reclaim(struct spdk_blob_store *bs)
+{
+	int rc;
+
+	rc = bs_reclaim_cluster_queues_init(bs);
+	if (rc != 0) {
+		return rc;
+	}
+
+	bs->reclaim_poller = SPDK_POLLER_REGISTER(bs_reclaim_cluster_poll, 
+				bs, RECLAIM_POLL_INTERVAL);
+	if (bs->reclaim_poller == NULL) {
+		bs_reclaim_cluster_queues_destroy(bs);
+		return -1;
+	}
+
+	return 0;
+}
+
+
+void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_store *bs = blob->bs;
+	struct cluster_to_reclaim *node;
+	static bool first = true;
+	uint32_t cluster_ref;
+	uint64_t i, j;
+	int rc;
+
+	assert(blob->md_ro == true);
+
+	/* temporaily unset read-only */
+	blob->md_ro = false;
+
+	rc = blob_set_xattr(blob, "SNAPHID", "true", strlen("true"), true);
+	if (rc < 0) {
+		goto exit;
+	}
+
+	blob->md_ro = true;
+
+	if (first) {
+		rc = bs_init_background_reclaim(bs);
+		if (rc < 0) {
+			goto exit;
+		}
+	}
+
+	for (i = 0; i < blob->active.num_clusters; i++) {
+		if (blob->active.clusters[i] == 0) continue;
+		cluster_ref = blob->active.ref_cnt[i];
+
+		node = calloc(1, sizeof(*node));
+		if (node == NULL) {
+			rc = -ENOMEM;
+			goto exit;
+		}
+		node->blob = blob;
+		node->cluster_idx = i;
+		node->last_child = SPDK_BLOBID_INVALID;
+
+		for (j = 0; j < QUEUE_CNT; j++) {
+			if (cluster_ref <= bs->queues[j]->upper_bound) {
+				TAILQ_INSERT_TAIL(&bs->queues[j]->list, node, link);
+				break;
+			}
+		}
+		if (cluster_ref > HIGH_UPPER_BOUND) {
+			TAILQ_INSERT_TAIL(&bs->queues[SUPER_HIGH]->list, node, link);
+		}
+	}
+
+	blob_sync_md(blob, cb_fn, cb_arg);
+
+	return;
+
+exit:
+	blob->md_ro = true;
+	blob_remove_xattr(blob, "SNAPHID", true);
+	cb_fn(cb_arg, rc);
+}
+/* END OF CLUSTER RECLAIM */
 
 static void
 blob_verify_md_op(struct spdk_blob *blob)
