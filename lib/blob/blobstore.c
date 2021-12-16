@@ -83,7 +83,6 @@ static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, vo
 #define BWRAID_VOLUME_MIN_SIZE (1ULL << 30)
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
 #define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
-#define RECLAIM_POLL_INTERVAL (60 * 60 * 1000)
 
 enum slice_status {
 	ERROR = -2,
@@ -964,6 +963,11 @@ blob_cow_update_snapshot_ref(struct blob_io_ctx *ctx)
 			assert(snap->active.ref_cnt);
 			assert(snap->active.ref_cnt[cluster] > 0);
 			snap->active.ref_cnt[cluster]--;
+			assert(snap->total_ref_cnt > 0);
+			snap->total_ref_cnt--;
+			/* TODO: need to persist md of snapshot or 
+			 * recover ref_cnt after system crash 
+			 * prefer the latter */
 		}
 	}
 
@@ -1724,22 +1728,27 @@ static void
 blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
 {
 	reclaim_cluster_ctx *ctx = cb_arg;
+	struct cluster_to_reclaim *target = ctx->current;
+	struct spdk_blob *snap = target->blob;
+	uint64_t cluster;
+	uint32_t queue_idx = ctx->queue_idx;
 
 	assert(ctx->outstanding_ops > 0);
 	ctx->outstanding_ops--;
 
 	if (ctx->outstanding_ops == 0) {
 		if (bserrno == 0) {
-			ctx->data_copied += ctx->cur_try_copy;
-			ctx->cur_try_copy = 0;
-			if (ctx->data_copied >= DATA_COPY_THRESHOLD) {
-				/* copy enough data, wait for next poll */
-				ctx->current->on_process = false;
-				free(ctx);
-				return;
-			}
+			/* TODO: error handle */
 		}
+		/* iter */
 		bs_reclaim_cluster_iter(ctx, bserrno);
+
+		if (snap->active.ref_cnt[target->cluster_idx] == 0) {
+			/* ref_cnt is zero, no need to copy data anymore
+			remove it from queue */
+			TAILQ_REMOVE(&snap->bs->queues[queue_idx]->list, target, link);
+			free(target);
+		}
 	}
 }
 
@@ -1777,6 +1786,7 @@ blob_touch_cluster_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 		ctx->sequencers[i]->read_count--;
 	} 
 
+	/* FIXME: may overwrite user's data */
 	blob_start_io(clone, channel, ctx->iov, ctx->iovcnt,
 				ctx->offset, ctx->length, blob_touch_cluster_write_cpl, ctx, false);
 }
@@ -1857,8 +1867,6 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 				bs_io_unit_to_back_dev_lba(clone, tctx->offset),
 				bs_io_unit_to_back_dev_lba(clone, tctx->length), 
 				blob_touch_cluster_write_copy, tctx);
-	/* TODO: try_copy may failed, actual copied data may get wrong */
-	ctx->cur_try_copy += tctx->length;
 
 	return;
 
@@ -1879,15 +1887,17 @@ blob_touch_clone_cluster(struct spdk_blob *clone, reclaim_cluster_ctx *ctx)
 	uint32_t idx, cnt = 0;
 	/* indicate if there is any previous copy process */
 	bool first = true;
-	int rc;
 
-	if (clone->active.clusters[cluster] == 0) {
-		/* cluster of this clone not allcoated
-		 * copy data is worthless, skip this clone */
-		goto next;
-	}
+	// if (clone->active.clusters[cluster] == 0) {
+	// 	/* cluster of this clone not allcoated
+	// 	 * copy data is worthless, skip this clone */
+	// 	goto next;
+	// }
 
 	start_slice = base_slice = cluster * bs->slices_per_cluster;
+	if (clone->active.clusters[cluster] == 0) {
+		cnt = bs->slices_per_cluster;
+	} else {
 	for (idx = 0; idx < bs->slices_per_cluster; idx++) {
 		if (blob_logic_slice_is_valid(clone, base_slice + idx)) {
 			if (!first) {
@@ -1899,11 +1909,8 @@ blob_touch_clone_cluster(struct spdk_blob *clone, reclaim_cluster_ctx *ctx)
 		} else {
 			first = false;
 			cnt++;
-			if (cnt * bs->slice_sz >= DATA_COPY_THRESHOLD) {
-				/* copied enough data */
-				break;
-			}
 		}
+	}
 	}
 
 	if (cnt != 0) {
@@ -1923,27 +1930,28 @@ static struct cluster_to_reclaim*
 bs_reclaim_cluster_get_next(reclaim_cluster_ctx *ctx, struct spdk_blob_store *bs)
 {
 	struct cluster_to_reclaim *cur = ctx->current, *next = NULL;
-	uint8_t queue_idx;
+	uint8_t i;
 
-	if ((next = TAILQ_NEXT(cur, link)) != NULL) {
-		ctx->current = next;
-		ctx->data_copied = 0;
-		return next;
+	if ((next = TAILQ_NEXT(cur, link)) == NULL) {
+		/* this queue not element left, move to next queue */
+		ctx->queue_idx++;
 	}
 
-	queue_idx = ctx->queue_idx + 1; /* move to next queue */
-	for (; queue_idx < QUEUE_CNT; queue_idx++) {
-		if (!TAILQ_EMPTY(&bs->queues[queue_idx]->list)) {
-			next = TAILQ_FIRST(&bs->queues[queue_idx]->list);
-			ctx->queue_idx = queue_idx;
-			ctx->current = next;
-			ctx->data_copied = 0;
-			return next;
+	for (i = ctx->queue_idx; i < QUEUE_CNT; i++) {
+		TAILQ_FOREACH_FROM(next, &bs->queues[i]->list, link) {
+			if (!next->on_process) {
+				next->on_process = true;
+				ctx->current = next;
+				ctx->queue_idx = i;
+				return next;
+			}
 		}
 	}
 
 	return NULL;
 }
+
+#define ITER_NEXT_CLUSTER 1
 
 static int
 bs_reclaim_cluster_get_next_clone(struct cluster_to_reclaim *target, struct spdk_blob **next)
@@ -1952,30 +1960,29 @@ bs_reclaim_cluster_get_next_clone(struct cluster_to_reclaim *target, struct spdk
 	spdk_blob_id *ids, next_id;
 	uint32_t i;
 	size_t clone_count = 0;
-	int rc = 0;
 
 	spdk_blob_get_clones(snap->bs, snap->id, NULL, &clone_count);
 
 	if (clone_count <= 1) {
-		/* TODO: delete snapshot */
-		return rc;
+		/* no need to copy, just swap md
+		 * move to next cluster */
+		return ITER_NEXT_CLUSTER;
 	}
 
-	/* TODO: last_child may have been deleted */
+	/* TODO: cur_child may have been deleted */
 
 	ids = calloc(clone_count, sizeof(*ids));
 	if (ids == NULL) {
 		SPDK_ERRLOG("No memory\n");
-		rc = -ENOMEM;
-		return rc;
+		return -ENOMEM;
 	}
 
 	spdk_blob_get_clones(snap->bs, snap->id, ids, &clone_count);
 
-	if (target->last_child != SPDK_BLOBID_INVALID) {
+	if (target->cur_child != SPDK_BLOBID_INVALID) {
 		/* has tried to copy data to previous clones, start from next clone */
 		for (i = 0; i < clone_count; i++) {
-			if (ids[i] == target->last_child) {
+			if (ids[i] == target->cur_child) {
 				/* locate last child index */
 				break;
 			}
@@ -1983,8 +1990,8 @@ bs_reclaim_cluster_get_next_clone(struct cluster_to_reclaim *target, struct spdk
 	
 		if (i == clone_count - 1) {
 			/* every clone of this snapshot cluster has tried */
-			target->last_child = SPDK_BLOBID_INVALID; /* reset iter index */
-			return rc;
+			target->cur_child = SPDK_BLOBID_INVALID; /* reset iter index */
+			return ITER_NEXT_CLUSTER;
 		}
 
 		next_id = ids[i+1];
@@ -1993,10 +2000,10 @@ bs_reclaim_cluster_get_next_clone(struct cluster_to_reclaim *target, struct spdk
 	}
 
 	*next = blob_lookup(snap->bs, next_id);
-	target->last_child = (*next)->id;
 	assert(next != NULL);
+	target->cur_child = (*next)->id;
 
-	return rc;
+	return 0;
 }
 
 static void
@@ -2016,18 +2023,23 @@ bs_reclaim_cluster_iter(reclaim_cluster_ctx *ctx, int bserrno)
 
 	rc = bs_reclaim_cluster_get_next_clone(target, &clone);
 	if (clone == NULL) {
-		/* every clone of this snapshot cluster has tried
-		move on to next cluster */
-		target = bs_reclaim_cluster_get_next(ctx, snap->bs);
-		if (target == NULL) {
-			/* no next cluster, just exit */
-			ctx->current->on_process = false;
-			free(ctx);
-			return;
+		switch (rc) {
+			case ITER_NEXT_CLUSTER:
+				/* every clone of this snapshot cluster has tried
+				move on to next cluster */
+				ctx->current->on_process = false;
+				target = bs_reclaim_cluster_get_next(ctx, snap->bs);
+				if (target == NULL) {
+					/* no next cluster, just exit */
+					free(ctx);
+					return;
+				}
+				/* recursive call */
+				bs_reclaim_cluster_iter(ctx, 0);
+				return;
+			default:
+				break;
 		}
-		/* recursive call */
-		bs_reclaim_cluster_iter(ctx, 0);
-		return;
 	}
 
 	blob_touch_clone_cluster(clone, ctx);
@@ -2166,7 +2178,7 @@ void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn
 		}
 		node->blob = blob;
 		node->cluster_idx = i;
-		node->last_child = SPDK_BLOBID_INVALID;
+		node->cur_child = SPDK_BLOBID_INVALID;
 
 		for (j = 0; j < QUEUE_CNT; j++) {
 			if (cluster_ref <= bs->queues[j]->upper_bound) {
@@ -2924,6 +2936,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 					ref = (data & CLUSTER_REF_MASK) >> CLUSTER_REF_SHIFT;
 					blob->active.clusters[blob->active.num_clusters] = bs_cluster_to_lba(blob->bs, cluster);
 					blob->active.ref_cnt[blob->active.num_clusters++] = ref;
+					blob->total_ref_cnt += ref;
 				} else if (spdk_blob_is_thin_provisioned(blob)) {
 					blob->active.clusters[blob->active.num_clusters] = 0;
 					blob->active.ref_cnt[blob->active.num_clusters++] = 0;
@@ -8098,6 +8111,21 @@ bs_snapshot_inc_ref_cnt(struct spdk_blob *snap)
 	for (i = 0; i < snap->active.num_clusters; i++) {
 		if (snap->active.clusters[i] != 0) {
 			snap->active.ref_cnt[i]++;
+			snap->total_ref_cnt++;
+		}
+	}
+}
+
+static inline void
+bs_snapshot_inc_dec_cnt(struct spdk_blob *snap)
+{
+	uint64_t i;
+
+	for (i = 0; i < snap->active.num_clusters; i++) {
+		if (snap->active.clusters[i] != 0) {
+			assert(snap->active.ref_cnt[i] > 0);
+			snap->active.ref_cnt[i]--;
+			snap->total_ref_cnt--;
 		}
 	}
 }
@@ -9392,6 +9420,7 @@ bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
 	spdk_bs_sequence_t *seq = cb_arg;
 	struct delete_snapshot_ctx *ctx;
+	struct spdk_blob *snap;
 	bool update_clone = false;
 
 	if (bserrno != 0) {
@@ -9439,6 +9468,12 @@ bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		update_clone_on_snapshot_deletion(blob, ctx);
 	} else {
 		/* This blob does not have any clones - just remove it */
+		/* update ref_cnt of parent, if it has parent */
+		if (blob->parent_id != SPDK_BLOBID_INVALID) {
+			snap = blob_lookup(blob->bs, blob->parent_id);
+			assert(snap != NULL);
+			bs_snapshot_inc_dec_cnt(snap);
+		}
 		bs_blob_list_remove(blob);
 		bs_delete_blob_finish(seq, blob, 0);
 		free(ctx);
@@ -10342,6 +10377,12 @@ spdk_bs_get_io_statistics(struct spdk_blob_store *bs, enum bs_io_type type)
 	}
 }
 #endif
+
+uint64_t
+spdk_blob_ref_cnt(struct spdk_blob *snap)
+{
+	return snap->total_ref_cnt;
+}
 
 SPDK_LOG_REGISTER_COMPONENT(blob)
 SPDK_LOG_REGISTER_COMPONENT(io)

@@ -171,7 +171,7 @@ typedef struct {
 struct cluster_to_reclaim {
 	struct spdk_blob *blob;
 	uint64_t cluster_idx;
-	spdk_blob_id last_child; /* clone that copy data to last time */
+	spdk_blob_id cur_child; /* clone that copy data */
 	bool on_process;
 	TAILQ_ENTRY(cluster_to_reclaim) link;
 };
@@ -316,6 +316,7 @@ struct spdk_blob {
 
 	struct rb_root cluster_sequencers_tree;
 	struct rb_root slice_sequencers_tree;
+	uint64_t total_ref_cnt;
 };
 
 struct spdk_blob_store {

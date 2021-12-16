@@ -96,10 +96,12 @@ struct spdk_lvol_store {
 	bool				destruct;
 	TAILQ_HEAD(, spdk_lvol)		lvols;
 	TAILQ_HEAD(, spdk_lvol)		pending_lvols;
+	TAILQ_HEAD(, spdk_lvol)		hidden_lvols;
 	bool				on_list;
 	TAILQ_ENTRY(spdk_lvol_store)	link;
 	char				name[SPDK_LVS_NAME_MAX];
 	char				new_name[SPDK_LVS_NAME_MAX];
+	struct spdk_poller *reclaim_poller;
 };
 
 struct spdk_lvol {
@@ -117,6 +119,7 @@ struct spdk_lvol {
 	enum blob_clear_method		clear_method;
 	bool	hidden;
 	TAILQ_ENTRY(spdk_lvol) link;
+	TAILQ_ENTRY(spdk_lvol) next;
 };
 
 struct lvol_store_bdev *vbdev_lvol_store_first(void);

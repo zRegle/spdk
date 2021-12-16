@@ -46,6 +46,7 @@ static TAILQ_HEAD(, lvol_store_bdev) g_spdk_lvol_pairs = TAILQ_HEAD_INITIALIZER(
 static int vbdev_lvs_init(void);
 static int vbdev_lvs_get_ctx_size(void);
 static void vbdev_lvs_examine(struct spdk_bdev *bdev);
+static int vbdev_destroy_hidden_snapshot(void *arg);
 
 static struct spdk_bdev_module g_lvol_if = {
 	.name = "lvol",
@@ -610,11 +611,27 @@ static void
 _vbdev_lvol_hide_snapshot_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *snapshot = req->lvol;
+	struct spdk_lvol_store *lvs = snapshot->lvol_store;
 
 	if (lvolerrno != 0) {
 		SPDK_ERRLOG("Renaming lvol failed\n");
 	}
 
+	if (lvs->reclaim_poller == NULL) {
+		lvs->reclaim_poller = SPDK_POLLER_REGISTER(vbdev_destroy_hidden_snapshot, 
+						  lvs, RECLAIM_POLL_INTERVAL);
+		if (lvs->reclaim_poller == NULL) {
+			SPDK_ERRLOG("Register poller failed\n");
+			lvolerrno = -EAGAIN;
+			goto exit;
+		}
+		TAILQ_INIT(&lvs->hidden_lvols);
+	}
+
+	TAILQ_INSERT_TAIL(&lvs->hidden_lvols, snapshot, next);
+
+exit:
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
 }
@@ -629,6 +646,7 @@ vbdev_lvol_hide_snapshot(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, vo
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
+	req->lvol = lvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
@@ -762,7 +780,7 @@ vbdev_lvol_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 			}
 			free(ids);
 		}
-
+		spdk_json_write_named_int64(w, "ref cnt", spdk_blob_ref_cnt(blob));
 	}
 
 end:
@@ -1394,6 +1412,98 @@ vbdev_lvol_get_from_bdev(struct spdk_bdev *bdev)
 	}
 
 	return (struct spdk_lvol *)bdev->ctxt;
+}
+
+typedef struct {
+	struct spdk_lvol *snap;
+	uint32_t outstanding_ops;
+} destroy_hidden_snap_ctx;
+
+static void
+vbdev_destroy_hidden_snapshot_cb(void *cb_arg, int lvolerrno)
+{
+	/* empty function */
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("destroy lvol failed\n");
+	}
+}
+
+static void
+vbdev_hidden_snapshot_decouple_cb(void *cb_arg, int bserrno)
+{
+	destroy_hidden_snap_ctx *ctx = cb_arg;
+	struct spdk_lvol *snap = ctx->snap;
+	struct spdk_lvol_store *lvs = snap->lvol_store;
+
+	assert(ctx->outstanding_ops > 0);
+	ctx->outstanding_ops--;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("snapshot decouple failed, rc: %d\n", bserrno);
+		TAILQ_INSERT_TAIL(&lvs->hidden_lvols, snap, next);
+		return;
+	}
+
+	if (ctx->outstanding_ops == 0) {
+		vbdev_lvol_destroy(snap, vbdev_destroy_hidden_snapshot_cb, NULL);
+		free(ctx);
+	}
+}
+
+static int
+vbdev_destroy_hidden_snapshot(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;
+	struct spdk_lvol *snap = NULL, *tsnap;
+	size_t clone_count = 0;
+	spdk_blob_id *ids = NULL;
+	struct spdk_io_channel *channel;
+	destroy_hidden_snap_ctx *ctx = NULL;
+	uint32_t i;
+
+	TAILQ_FOREACH_FROM_SAFE(snap, &lvs->hidden_lvols, next, tsnap) {
+		spdk_blob_get_clones(lvs->blobstore, snap->blob_id, NULL, &clone_count);
+		if (clone_count > 0) {
+			if (spdk_blob_ref_cnt(snap->blob) == 0) {
+				/* ref count is zero, ready to destory */
+				TAILQ_REMOVE(&lvs->hidden_lvols, snap, next);
+				ids = calloc(clone_count, sizeof(spdk_blob_id));
+				if (ids == NULL) {
+					SPDK_ERRLOG("calloc failed\n");
+					return SPDK_POLLER_IDLE;
+				}
+				spdk_blob_get_clones(lvs->blobstore, snap->blob_id, ids, &clone_count);
+
+				channel = spdk_bs_alloc_io_channel(lvs->blobstore);
+				if (channel == NULL) {
+					SPDK_ERRLOG("get bs io channel failed\n");
+					free(ids);
+					return SPDK_POLLER_IDLE;
+				}
+
+				ctx = calloc(1, sizeof(*ctx));
+				if (ctx == NULL) {
+					SPDK_ERRLOG("calloc failed\n");
+					free(ids);
+					return SPDK_POLLER_IDLE;
+				}
+				ctx->snap = snap;
+				ctx->outstanding_ops = clone_count;
+
+				for (i = 0; i < clone_count; i++) {
+					/* decouple all clones */
+					spdk_bs_blob_decouple_parent(lvs->blobstore, channel, ids[i], 
+								vbdev_hidden_snapshot_decouple_cb, ctx);
+				}
+				free(ids);
+			}
+		} else {
+			TAILQ_REMOVE(&lvs->hidden_lvols, snap, next);
+			vbdev_lvol_destroy(snap, vbdev_destroy_hidden_snapshot_cb, NULL);
+		}
+	}
+
+	return SPDK_POLLER_BUSY;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

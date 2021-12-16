@@ -79,6 +79,10 @@ lvs_free(struct spdk_lvol_store *lvs)
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
+	if (lvs->reclaim_poller != NULL) {
+		spdk_poller_unregister(&lvs->reclaim_poller);
+	}
+
 	free(lvs);
 }
 
