@@ -1547,3 +1547,31 @@ spdk_lvol_decouple_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, v
 	spdk_bs_blob_decouple_parent(lvol->lvol_store->blobstore, req->channel, blob_id,
 				     lvol_inflate_cb, req);
 }
+
+static void
+_set_token_rate_cb(void *cb_arg, int lvserrno)
+{
+	struct spdk_lvs_req *lvs_req = cb_arg;
+
+	lvs_req->cb_fn(lvs_req->cb_arg, lvserrno);
+	free(lvs_req);
+}
+
+void
+spdk_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
+			  spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *lvs_req;
+
+	lvs_req = calloc(1, sizeof(*lvs_req));
+	if (!lvs_req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol store request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	lvs_req->cb_fn = cb_fn;
+	lvs_req->cb_arg = cb_arg;
+
+	spdk_bs_set_token_rate(lvs->blobstore, token_rate, _set_token_rate_cb, lvs_req);
+}

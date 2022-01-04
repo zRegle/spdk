@@ -208,6 +208,10 @@ class UIRoot(UINode):
     @verbose
     def bdev_lvol_get_lvs_mask(self, **kwargs):
         rpc.lvol.bdev_lvol_get_lvs_mask(self.client, **kwargs)
+    
+    @verbose
+    def bdev_lvol_lvstore_set_token_rate(self, **kwargs):
+        rpc.lvol.bdev_lvol_lvstore_set_token_rate(self.client, **kwargs)
 
     @verbose
     def bdev_pmem_create_pool(self, **kwargs):

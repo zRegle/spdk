@@ -1732,6 +1732,16 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-o', '--output-file', help='output filename', required=False)
     p.set_defaults(func=bdev_lvol_get_lvs_mask)
 
+    def bdev_lvol_lvstore_set_token_rate(args):
+        rpc.lvol.bdev_lvol_lvstore_set_token_rate(args.client,
+                                    lvs_name=args.lvs_name,
+                                    token_rate=args.token_rate)
+    
+    p = subparsers.add_parser('bdev_lvol_lvstore_set_token_rate', help='set token rate of lvs')
+    p.add_argument('-l', '--lvs-name', help='lvol store name', required=True)
+    p.add_argument('-t', '--token-rate', help='token rate', type=int, required=True)
+    p.set_defaults(func=bdev_lvol_lvstore_set_token_rate)
+
     def bdev_raid_get_bdevs(args):
         print_array(rpc.bdev.bdev_raid_get_bdevs(args.client,
                                                  category=args.category))

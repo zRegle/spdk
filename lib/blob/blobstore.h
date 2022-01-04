@@ -190,6 +190,21 @@ enum copy_workload {
 	SUPER_HIGH = 4
 };
 
+typedef struct{
+	uint32_t latency; /* measured in us */
+	uint32_t iops; /* measured in K */
+	uint32_t read_ratio; /* 0 ~ 100 */
+} SLO;
+
+struct token_tenant {
+	uint64_t tokens;
+	SLO slo;
+	struct spdk_poller *token_generator;
+	TAILQ_ENTRY(token_tenant) link;
+};
+
+typedef struct token_tenant token_tenant;
+
 struct spdk_xattr {
 	uint32_t	index;
 	uint16_t	value_len;
@@ -369,6 +384,8 @@ struct spdk_blob_store {
 	mem_pool_factory	*factory;
 	cluster_queue *queues[QUEUE_CNT];
 	struct spdk_poller *reclaim_poller;
+	uint64_t dev_token_rate;
+	TAILQ_HEAD(, token_tenant) tenants;
 #ifdef DEBUG
 	blob_io_statistics slice;
 	blob_io_statistics cluster;

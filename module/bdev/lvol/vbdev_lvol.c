@@ -1506,4 +1506,37 @@ vbdev_destroy_hidden_snapshot(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+static void
+set_token_rate_cb(void *cb_arg, int lvserrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+
+	if (lvserrno != 0) {
+		SPDK_ERRLOG("Set token rate failed\n");
+	}
+
+	req->cb_fn(req->cb_arg, lvserrno);
+	free(req);
+}
+
+void vbdev_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
+			  spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for vbdev lvol store request pointer\n");
+		if (cb_fn != NULL) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	spdk_lvs_set_token_rate(lvs, token_rate, set_token_rate_cb, req);
+}
+
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

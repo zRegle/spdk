@@ -138,4 +138,7 @@ struct rpc_bdev_lvol_get_lvs_mask_cb_arg {
 	struct spdk_bs_mask_info *info;
 };
 
+void vbdev_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
+			  spdk_lvs_op_complete cb_fn, void *cb_arg);
+
 #endif /* SPDK_VBDEV_LVOL_H */

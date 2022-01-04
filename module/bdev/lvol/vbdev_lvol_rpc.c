@@ -295,6 +295,71 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_delete_lvstore", rpc_bdev_lvol_delete_lvstore, SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_lvol_delete_lvstore, destroy_lvol_store)
 
+struct rpc_bdev_lvol_lvstore_set_token_rate {
+	char *lvs_name;
+	uint64_t token_rate;
+};
+
+static void
+free_rpc_bdev_lvol_lvstore_set_token_rate(struct rpc_bdev_lvol_lvstore_set_token_rate *req)
+{
+	free(req->lvs_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_lvstore_set_token_rate_decoders[] = {
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_lvstore_set_token_rate, lvs_name), spdk_json_decode_string},
+	{"token_rate", offsetof(struct rpc_bdev_lvol_lvstore_set_token_rate, token_rate), spdk_json_decode_uint64}
+};
+
+static void
+rpc_set_token_rate_cb(void *cb_arg, int lvserrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	if (lvserrno != 0) {
+		goto invalid;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	return;
+
+invalid:
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 spdk_strerror(-lvserrno));
+}
+
+static void
+rpc_bdev_lvol_lvstore_set_token_rate(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_lvstore_set_token_rate req = {};
+	struct spdk_lvol_store *lvs = NULL;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_lvstore_set_token_rate_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_lvstore_set_token_rate_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	lvs = vbdev_get_lvol_store_by_name(req.lvs_name);
+	if (lvs == NULL) {
+		SPDK_INFOLOG(lvol_rpc, "no lvs existing for given name\n");
+		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req.lvs_name);
+		goto cleanup;
+	}
+
+	vbdev_lvs_set_token_rate(lvs, req.token_rate, rpc_set_token_rate_cb, request);
+
+cleanup:
+	free_rpc_bdev_lvol_lvstore_set_token_rate(&req);
+}
+SPDK_RPC_REGISTER("bdev_lvol_lvstore_set_token_rate", rpc_bdev_lvol_lvstore_set_token_rate, SPDK_RPC_RUNTIME)
+SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_lvol_lvstore_set_token_rate, set_token_rate)
+
+
 struct rpc_bdev_lvol_create {
 	char *uuid;
 	char *lvs_name;

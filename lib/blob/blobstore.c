@@ -1730,7 +1730,6 @@ blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
 	reclaim_cluster_ctx *ctx = cb_arg;
 	struct cluster_to_reclaim *target = ctx->current;
 	struct spdk_blob *snap = target->blob;
-	uint64_t cluster;
 	uint32_t queue_idx = ctx->queue_idx;
 
 	assert(ctx->outstanding_ops > 0);
@@ -1922,7 +1921,6 @@ blob_touch_clone_cluster(struct spdk_blob *clone, reclaim_cluster_ctx *ctx)
 
 	/* slices of this cluster in this clone are all valid
 	no need to copy data, move to next iteration */
-next:
 	bs_reclaim_cluster_iter(ctx, 0);
 }
 
@@ -2199,6 +2197,19 @@ exit:
 	blob->md_ro = true;
 	blob_remove_xattr(blob, "SNAPHID", true);
 	cb_fn(cb_arg, rc);
+}
+
+void spdk_bs_set_token_rate(struct spdk_blob_store *bs, uint64_t token_rate, 
+			  spdk_bs_op_complete cb_fn, void *cb_arg)
+{
+	if (token_rate == 0) {
+		SPDK_ERRLOG("Invalid token rate: %lu\n", token_rate);
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	bs->dev_token_rate = token_rate;
+	cb_fn(cb_arg, 0);
 }
 /* END OF CLUSTER RECLAIM */
 

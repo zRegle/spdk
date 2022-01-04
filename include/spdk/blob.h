@@ -996,6 +996,9 @@ void spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **inf
 				enum bs_mask_type type, int *bserrno);
 void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 uint64_t spdk_blob_ref_cnt(struct spdk_blob *snap);
+
+void spdk_bs_set_token_rate(struct spdk_blob_store *bs, uint64_t token_rate, 
+			  spdk_bs_op_complete cb_fn, void *cb_arg);
 #ifdef __cplusplus
 }
 #endif
