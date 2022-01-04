@@ -999,6 +999,14 @@ uint64_t spdk_blob_ref_cnt(struct spdk_blob *snap);
 
 void spdk_bs_set_token_rate(struct spdk_blob_store *bs, uint64_t token_rate, 
 			  spdk_bs_op_complete cb_fn, void *cb_arg);
+typedef struct {
+	uint32_t latency;
+	uint32_t iops;
+	uint32_t read_ratio;
+} spdk_bs_tenant_opts;
+
+void spdk_bs_register_tenant(struct spdk_blob_store *bs, spdk_bs_tenant_opts *o, 
+			  spdk_bs_op_complete cb_fn, void *cb_arg);
 #ifdef __cplusplus
 }
 #endif

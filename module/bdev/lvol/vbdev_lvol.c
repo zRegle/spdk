@@ -1509,7 +1509,7 @@ vbdev_destroy_hidden_snapshot(void *arg)
 static void
 set_token_rate_cb(void *cb_arg, int lvserrno)
 {
-	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvs_req *req = cb_arg;
 
 	if (lvserrno != 0) {
 		SPDK_ERRLOG("Set token rate failed\n");
@@ -1537,6 +1537,45 @@ void vbdev_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate,
 	req->cb_arg = cb_arg;
 
 	spdk_lvs_set_token_rate(lvs, token_rate, set_token_rate_cb, req);
+}
+
+static void
+_lvs_register_tenant_cb(void *cb_arg, int lvserrno)
+{
+	struct spdk_lvs_req *req = cb_arg;
+
+	if (lvserrno != 0) {
+		SPDK_ERRLOG("Register tenant failed\n");
+	}
+
+	req->cb_fn(req->cb_arg, lvserrno);
+	free(req);
+}
+
+void vbdev_lvs_register_tenant(struct spdk_lvol_store *lvs, 
+					 uint32_t latency, uint32_t iops, uint32_t read_ratio,
+					 spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *req;
+	spdk_lvs_tenant_opts opts = {};
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for vbdev lvol store request pointer\n");
+		if (cb_fn != NULL) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	opts.latency = latency;
+	opts.iops = iops;
+	opts.read_ratio = read_ratio;
+
+	spdk_lvs_register_tenant(lvs, &opts, _lvs_register_tenant_cb, req);
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

@@ -83,6 +83,7 @@ static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, vo
 #define BWRAID_VOLUME_MIN_SIZE (1ULL << 30)
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
 #define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
+#define TOKEN_GENERATE_PERIOD 1000
 
 enum slice_status {
 	ERROR = -2,
@@ -2209,6 +2210,49 @@ void spdk_bs_set_token_rate(struct spdk_blob_store *bs, uint64_t token_rate,
 	}
 
 	bs->dev_token_rate = token_rate;
+	cb_fn(cb_arg, 0);
+}
+
+static int
+bs_token_generate(void *arg)
+{
+	struct spdk_blob_store *bs = arg;
+	token_tenant *tenant;
+
+	TAILQ_FOREACH(tenant, &bs->tenants, link) {
+		/* TODO: fulfill tenant tokens */
+	}
+
+	return SPDK_POLLER_BUSY;
+}
+
+void 
+spdk_bs_register_tenant(struct spdk_blob_store *bs, spdk_bs_tenant_opts *o, 
+			  spdk_bs_op_complete cb_fn, void *cb_arg)
+{
+	token_tenant *tenant;
+
+	tenant = calloc(1, sizeof(*tenant));
+	if (tenant == NULL) {
+		SPDK_ERRLOG("calloc failed\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	tenant->slo.latency = o->latency;
+	tenant->slo.iops = o->iops;
+	tenant->slo.read_ratio = o->read_ratio;
+
+	if (TAILQ_EMPTY(&bs->tenants)) {
+		bs->token_generator = SPDK_POLLER_REGISTER(bs_token_generate, bs, TOKEN_GENERATE_PERIOD);
+		if (bs->token_generator == NULL) {
+			SPDK_ERRLOG("register poller failed\n");
+			return;
+		}
+	}
+
+	TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
+
 	cb_fn(cb_arg, 0);
 }
 /* END OF CLUSTER RECLAIM */
@@ -5613,6 +5657,8 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	if (rc != 0) {
 		goto exit;
 	}
+
+	TAILQ_INIT(&bs->tenants);
 
 	*_ctx = ctx;
 	*_bs = bs;

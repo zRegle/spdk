@@ -359,6 +359,74 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_lvstore_set_token_rate", rpc_bdev_lvol_lvstore_set_token_rate, SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_lvol_lvstore_set_token_rate, set_token_rate)
 
+struct rpc_bdev_lvol_lvstore_register_tenant {
+	char *lvs_name;
+	uint32_t latency;
+	uint32_t iops;
+	uint32_t read_ratio;
+};
+
+static void
+free_rpc_bdev_lvol_lvstore_register_tenant(struct rpc_bdev_lvol_lvstore_register_tenant *req)
+{
+	free(req->lvs_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_lvstore_register_tenant_decoders[] = {
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_lvstore_register_tenant, lvs_name), spdk_json_decode_string},
+	{"latency", offsetof(struct rpc_bdev_lvol_lvstore_register_tenant, latency), spdk_json_decode_uint32},
+	{"iops", offsetof(struct rpc_bdev_lvol_lvstore_register_tenant, iops), spdk_json_decode_uint32},
+	{"read_ratio", offsetof(struct rpc_bdev_lvol_lvstore_register_tenant, read_ratio), spdk_json_decode_uint32}
+};
+
+static void
+rpc_lvs_register_tenant_cb(void *cb_arg, int lvserrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	if (lvserrno != 0) {
+		goto invalid;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	return;
+
+invalid:
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 spdk_strerror(-lvserrno));
+}
+
+static void
+rpc_bdev_lvol_lvstore_register_tenant(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_lvstore_register_tenant req = {};
+	struct spdk_lvol_store *lvs;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_lvstore_register_tenant_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_lvstore_register_tenant_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	lvs = vbdev_get_lvol_store_by_name(req.lvs_name);
+	if (lvs == NULL) {
+		SPDK_INFOLOG(lvol_rpc, "no lvs existing for given name\n");
+		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req.lvs_name);
+		goto cleanup;
+	}
+
+	vbdev_lvs_register_tenant(lvs, req.latency, req.iops, req.read_ratio,
+					 rpc_lvs_register_tenant_cb, request);
+
+cleanup:
+	free_rpc_bdev_lvol_lvstore_register_tenant(&req);
+}
+SPDK_RPC_REGISTER("bdev_lvol_lvstore_register_tenant", rpc_bdev_lvol_lvstore_register_tenant, SPDK_RPC_RUNTIME)
+SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_lvol_lvstore_register_tenant, lvs_register_tenant)
 
 struct rpc_bdev_lvol_create {
 	char *uuid;

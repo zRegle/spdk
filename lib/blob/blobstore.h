@@ -199,7 +199,6 @@ typedef struct{
 struct token_tenant {
 	uint64_t tokens;
 	SLO slo;
-	struct spdk_poller *token_generator;
 	TAILQ_ENTRY(token_tenant) link;
 };
 
@@ -386,6 +385,7 @@ struct spdk_blob_store {
 	struct spdk_poller *reclaim_poller;
 	uint64_t dev_token_rate;
 	TAILQ_HEAD(, token_tenant) tenants;
+	struct spdk_poller *token_generator;
 #ifdef DEBUG
 	blob_io_statistics slice;
 	blob_io_statistics cluster;

@@ -140,5 +140,8 @@ struct rpc_bdev_lvol_get_lvs_mask_cb_arg {
 
 void vbdev_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
 			  spdk_lvs_op_complete cb_fn, void *cb_arg);
+void vbdev_lvs_register_tenant(struct spdk_lvol_store *lvs, 
+					 uint32_t latency, uint32_t iops, uint32_t read_ratio,
+					 spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 #endif /* SPDK_VBDEV_LVOL_H */

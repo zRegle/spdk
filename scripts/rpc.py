@@ -1742,6 +1742,19 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-t', '--token-rate', help='token rate', type=int, required=True)
     p.set_defaults(func=bdev_lvol_lvstore_set_token_rate)
 
+    def bdev_lvol_lvstore_register_tenant(args):
+        rpc.lvol.bdev_lvol_lvstore_register_tenant(args.client,
+                                    lvs_name=args.lvs_name,
+                                    latency=args.latency,
+                                    iops=args.iops,
+                                    read_ratio=args.read_ratio)
+    p = subparsers.add_parser('bdev_lvol_lvstore_register_tenant', help='register a tenant')
+    p.add_argument('-l', '--lvs-name', help='lvol store name', required=True)
+    p.add_argument('-L', '--latency', help='latency requiremnt, measured in us', type=int, required=True)
+    p.add_argument('-i', '--iops', help='iops requiremnt, measured in K', type=int, required=True)
+    p.add_argument('-r', '--read-ratio', help='read ratio, 0-100', type=int, required=True)
+    p.set_defaults(func=bdev_lvol_lvstore_register_tenant)
+
     def bdev_raid_get_bdevs(args):
         print_array(rpc.bdev.bdev_raid_get_bdevs(args.client,
                                                  category=args.category))

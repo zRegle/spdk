@@ -244,4 +244,13 @@ def bdev_lvol_lvstore_set_token_rate(client, lvs_name=None, token_rate=None):
         'token_rate': token_rate
     }
     return client.call('bdev_lvol_lvstore_set_token_rate', params)
+
+def bdev_lvol_lvstore_register_tenant(client, lvs_name, latency, iops, read_ratio):
+    params = {
+        'lvs_name': lvs_name,
+        'latency': latency,
+        'iops': iops,
+        'read_ratio': read_ratio
+    }
+    return client.call('bdev_lvol_lvstore_register_tenant', params)
     

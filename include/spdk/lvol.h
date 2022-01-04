@@ -306,6 +306,15 @@ void spdk_lvol_hide(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *c
 void spdk_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
 			  spdk_lvs_op_complete cb_fn, void *cb_arg);
 
+typedef struct {
+	uint32_t latency;
+	uint32_t iops;
+	uint32_t read_ratio;
+} spdk_lvs_tenant_opts;
+
+void spdk_lvs_register_tenant(struct spdk_lvol_store *lvs, spdk_lvs_tenant_opts *o,
+		  spdk_lvs_op_complete cb_fn, void *cb_arg);
+
 #ifdef __cplusplus
 }
 #endif

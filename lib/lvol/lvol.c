@@ -1575,3 +1575,36 @@ spdk_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate,
 
 	spdk_bs_set_token_rate(lvs->blobstore, token_rate, _set_token_rate_cb, lvs_req);
 }
+
+static void
+_lvs_register_tenant_cb(void *cb_arg, int lvserrno)
+{
+	struct spdk_lvs_req *lvs_req = cb_arg;
+
+	lvs_req->cb_fn(lvs_req->cb_arg, lvserrno);
+	free(lvs_req);
+}
+
+void 
+spdk_lvs_register_tenant(struct spdk_lvol_store *lvs, spdk_lvs_tenant_opts *o,
+		  spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *lvs_req;
+	spdk_bs_tenant_opts opts;
+
+	lvs_req = calloc(1, sizeof(*lvs_req));
+	if (!lvs_req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol store request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	lvs_req->cb_fn = cb_fn;
+	lvs_req->cb_arg = cb_arg;
+
+	opts.latency = o->latency;
+	opts.iops = o->iops;
+	opts.read_ratio = o->read_ratio;
+
+	spdk_bs_register_tenant(lvs->blobstore, &opts, _lvs_register_tenant_cb, lvs_req);
+}
