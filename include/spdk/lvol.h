@@ -303,7 +303,13 @@ void spdk_lvol_decouple_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_
 
 void spdk_lvol_hide(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 
-void spdk_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
+typedef struct {
+	uint32_t token_rate;
+	uint32_t rd_only_token_rate;
+	uint32_t write_factor;
+} spdk_lvs_params;
+
+void spdk_lvs_set_params(struct spdk_lvol_store *lvs, spdk_lvs_params *p, 
 			  spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 typedef struct {

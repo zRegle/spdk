@@ -1507,7 +1507,7 @@ vbdev_destroy_hidden_snapshot(void *arg)
 }
 
 static void
-set_token_rate_cb(void *cb_arg, int lvserrno)
+_lvs_set_params_cb(void *cb_arg, int lvserrno)
 {
 	struct spdk_lvs_req *req = cb_arg;
 
@@ -1519,10 +1519,13 @@ set_token_rate_cb(void *cb_arg, int lvserrno)
 	free(req);
 }
 
-void vbdev_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
+void vbdev_lvs_set_params(struct spdk_lvol_store *lvs, 
+			  uint32_t token_rate, uint32_t rd_only_token_rate, 
+			  uint32_t write_factor,
 			  spdk_lvs_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvs_req *req;
+	spdk_lvs_params p = {};
 
 	req = calloc(1, sizeof(*req));
 	if (!req) {
@@ -1536,7 +1539,11 @@ void vbdev_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate,
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	spdk_lvs_set_token_rate(lvs, token_rate, set_token_rate_cb, req);
+	p.token_rate = token_rate;
+	p.rd_only_token_rate = rd_only_token_rate;
+	p.write_factor = write_factor;
+
+	spdk_lvs_set_params(lvs, &p, _lvs_set_params_cb, req);
 }
 
 static void

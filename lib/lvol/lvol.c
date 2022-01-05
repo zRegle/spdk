@@ -1549,7 +1549,7 @@ spdk_lvol_decouple_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, v
 }
 
 static void
-_set_token_rate_cb(void *cb_arg, int lvserrno)
+_lvs_set_params_cb(void *cb_arg, int lvserrno)
 {
 	struct spdk_lvs_req *lvs_req = cb_arg;
 
@@ -1558,10 +1558,11 @@ _set_token_rate_cb(void *cb_arg, int lvserrno)
 }
 
 void
-spdk_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate, 
+spdk_lvs_set_params(struct spdk_lvol_store *lvs, spdk_lvs_params *p, 
 			  spdk_lvs_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvs_req *lvs_req;
+	spdk_bs_params params = {};
 
 	lvs_req = calloc(1, sizeof(*lvs_req));
 	if (!lvs_req) {
@@ -1573,7 +1574,11 @@ spdk_lvs_set_token_rate(struct spdk_lvol_store *lvs, uint64_t token_rate,
 	lvs_req->cb_fn = cb_fn;
 	lvs_req->cb_arg = cb_arg;
 
-	spdk_bs_set_token_rate(lvs->blobstore, token_rate, _set_token_rate_cb, lvs_req);
+	params.token_rate = p->token_rate;
+	params.rd_only_token_rate = p->rd_only_token_rate;
+	params.write_factor = p->write_factor;
+
+	spdk_bs_set_params(lvs->blobstore, &params, _lvs_set_params_cb, lvs_req);
 }
 
 static void

@@ -1732,15 +1732,19 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-o', '--output-file', help='output filename', required=False)
     p.set_defaults(func=bdev_lvol_get_lvs_mask)
 
-    def bdev_lvol_lvstore_set_token_rate(args):
-        rpc.lvol.bdev_lvol_lvstore_set_token_rate(args.client,
+    def bdev_lvol_lvstore_set_params(args):
+        rpc.lvol.bdev_lvol_lvstore_set_params(args.client,
                                     lvs_name=args.lvs_name,
-                                    token_rate=args.token_rate)
+                                    token_rate=args.token_rate,
+                                    rd_only_token_rate=args.rd_only_token_rate,
+                                    write_factor=args.write_factor)
     
-    p = subparsers.add_parser('bdev_lvol_lvstore_set_token_rate', help='set token rate of lvs')
+    p = subparsers.add_parser('bdev_lvol_lvstore_set_params', help='set params of lvs')
     p.add_argument('-l', '--lvs-name', help='lvol store name', required=True)
     p.add_argument('-t', '--token-rate', help='token rate', type=int, required=True)
-    p.set_defaults(func=bdev_lvol_lvstore_set_token_rate)
+    p.add_argument('-r', '--rd-only-token-rate', help='read only token rate', type=int, required=True)
+    p.add_argument('-w', '--write-factor', help='write factor', type=int, required=True)
+    p.set_defaults(func=bdev_lvol_lvstore_set_params)
 
     def bdev_lvol_lvstore_register_tenant(args):
         rpc.lvol.bdev_lvol_lvstore_register_tenant(args.client,

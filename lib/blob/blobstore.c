@@ -82,7 +82,7 @@ static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, vo
 #define SLICE_MASK_HEADER (sizeof(struct spdk_bs_md_mask) * CHAR_BIT)
 #define BWRAID_VOLUME_MIN_SIZE (1ULL << 30)
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
-#define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
+// #define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
 #define TOKEN_GENERATE_PERIOD 1000
 
 enum slice_status {
@@ -1752,13 +1752,82 @@ blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
 	}
 }
 
+static inline uint32_t
+bs_compute_request_cost(struct spdk_blob_store *bs, uint32_t size, enum spdk_blob_op_type type)
+{
+	uint32_t size_scale_factor = spdk_divide_round_up(size, SPDK_BS_PAGE_SIZE);
+
+	switch (type) {
+	case SPDK_BLOB_READV:
+		return size_scale_factor;
+	case SPDK_BLOB_WRITEV:
+		return bs->write_factor * size_scale_factor;
+	default:
+		SPDK_ERRLOG("Error op type %d\n", type);
+		return UINT32_MAX;
+	}
+}
+
+static void
+bs_resource_get_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand)
+{
+	token_tenant *t;
+
+	TAILQ_FOREACH(t, &bs->tenants, link) {
+		if (strcasecmp(t->name, "resource-reclaimer") == 0) {
+			break;
+		}
+	}
+
+	assert(t != NULL);
+	assert(t->tokens > tokens_demand);
+	t->tokens -= tokens_demand;
+}
+
+static void
+bs_resource_put_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand)
+{
+	token_tenant *t;
+
+	TAILQ_FOREACH(t, &bs->tenants, link) {
+		if (strcasecmp(t->name, "resource-reclaimer") == 0) {
+			break;
+		}
+	}
+
+	assert(t != NULL);
+	t->tokens += tokens_demand;
+	t->tokens = spdk_min(t->scaledIOPS, t->tokens);
+}
+
 static void
 blob_touch_cluster_write_cpl(void *cb_arg, int bserrno)
 {
 	touch_cluster_ctx *ctx = cb_arg;
+	struct spdk_blob_store *bs = ctx->clone->bs;
+	uint64_t token_demand, request_bytes;
+	
+	request_bytes = ctx->length * bs->io_unit_size;
+	token_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_WRITEV);
+	bs_resource_put_tokens(bs, token_demand);
 
 	bs_sequence_finish(ctx->seq, bserrno);
 	free_touch_cluster_ctx(ctx);
+}
+
+static inline bool
+bs_resource_reclaim_op_control(struct spdk_blob_store *bs, uint64_t tokens_demand)
+{
+	token_tenant *t;
+
+	TAILQ_FOREACH(t, &bs->tenants, link) {
+		if (strcasecmp(t->name, "resource-reclaimer") == 0) {
+			break;
+		}
+	}
+
+	assert(t != NULL);
+	return t->tokens > tokens_demand;
 }
 
 static void
@@ -1766,8 +1835,16 @@ blob_touch_cluster_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 {
 	touch_cluster_ctx *ctx = cb_arg;
 	struct spdk_blob *clone = ctx->clone;
+	struct spdk_blob_store *bs = clone->bs;
 	struct spdk_io_channel *channel;
 	uint32_t i, count;
+	uint64_t tokens_demand, request_bytes;
+
+	count = ctx->length * clone->bs->io_unit_size / clone->bs->slice_sz;
+	
+	request_bytes = bs->slice_sz * count;
+	tokens_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_READV);
+	bs_resource_put_tokens(bs, tokens_demand);
 
 	if (bserrno != 0) {
 		bs_sequence_finish(seq, bserrno);
@@ -1778,13 +1855,22 @@ blob_touch_cluster_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	channel = spdk_bs_alloc_io_channel(ctx->clone->bs);
 	assert(channel != NULL);
 
-	count = ctx->length * clone->bs->io_unit_size / clone->bs->slice_sz;
 	assert(count > 0);
 	for (i = 0; i < count; i++) {
 		assert(ctx->sequencers[i]->read_count > 0);
 		/* read finish, read count minus one */
 		ctx->sequencers[i]->read_count--;
 	} 
+
+	tokens_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_WRITEV);
+
+	if (!bs_resource_reclaim_op_control(bs, tokens_demand)) {
+		bs_sequence_finish(seq, -EACCES);
+		free_touch_cluster_ctx(ctx);
+		return;
+	} else {
+		bs_resource_get_tokens(bs, tokens_demand);
+	}
 
 	/* FIXME: may overwrite user's data */
 	blob_start_io(clone, channel, ctx->iov, ctx->iovcnt,
@@ -1801,6 +1887,7 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 	struct spdk_bs_cpl cpl;
 	struct spdk_io_channel *channel;
 	uint32_t i;
+	uint64_t tokens_demand, request_bytes;
 	int rc = 0;
 
 	tctx = calloc(1, sizeof(*tctx));
@@ -1861,6 +1948,16 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 	if (tctx->seq == NULL) {
 		rc = -ENOMEM;
 		goto exit;		
+	}
+
+	request_bytes = bs->slice_sz * count;
+	tokens_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_READV);
+
+	if (!bs_resource_reclaim_op_control(bs, tokens_demand)) {
+		rc = -EACCES;
+		goto exit;
+	} else {
+		bs_resource_get_tokens(bs, tokens_demand);
 	}
 
 	bs_sequence_readv_bs_dev(tctx->seq, clone->back_bs_dev, iov, tctx->iovcnt,
@@ -2017,7 +2114,14 @@ bs_reclaim_cluster_iter(reclaim_cluster_ctx *ctx, int bserrno)
 
 	if (bserrno != 0) {
 		/* TODO: error hanlde */
-		return;
+		switch (bserrno) {
+			case -EACCES:
+				/* lack of tokens, wait for next time */
+				free(ctx);
+				break;
+			default:
+				break;
+		}
 	}
 
 	rc = bs_reclaim_cluster_get_next_clone(target, &clone);
@@ -2117,9 +2221,25 @@ exit:
 	return -ENOMEM;
 }
 
+static inline uint32_t
+bs_compute_reclaim_scaleIOPS(struct spdk_blob_store *bs)
+{
+	token_tenant *t;
+	uint64_t tenant_sum_tokens = 0;
+
+	TAILQ_FOREACH(t, &bs->tenants, link) {
+		tenant_sum_tokens += t->scaledIOPS * 1000;
+	}
+
+	assert(tenant_sum_tokens < bs->token_rate);
+
+	return bs->token_rate - tenant_sum_tokens;
+}
+
 static int
 bs_init_background_reclaim(struct spdk_blob_store *bs)
 {
+	token_tenant *resource_reclaimer;
 	int rc;
 
 	rc = bs_reclaim_cluster_queues_init(bs);
@@ -2133,6 +2253,17 @@ bs_init_background_reclaim(struct spdk_blob_store *bs)
 		bs_reclaim_cluster_queues_destroy(bs);
 		return -1;
 	}
+
+	resource_reclaimer = calloc(1, sizeof(*resource_reclaimer));
+	if (resource_reclaimer == NULL) {
+		spdk_poller_unregister(&bs->reclaim_poller);
+		bs_reclaim_cluster_queues_destroy(bs);
+		return -1;
+	}
+
+	resource_reclaimer->name = "resource-reclaimer";
+	resource_reclaimer->scaledIOPS = 0;
+	TAILQ_INSERT_TAIL(&bs->tenants, resource_reclaimer, link);
 
 	return 0;
 }
@@ -2199,29 +2330,41 @@ exit:
 	blob_remove_xattr(blob, "SNAPHID", true);
 	cb_fn(cb_arg, rc);
 }
+/* END OF CLUSTER RECLAIM */
 
-void spdk_bs_set_token_rate(struct spdk_blob_store *bs, uint64_t token_rate, 
+void spdk_bs_set_params(struct spdk_blob_store *bs, spdk_bs_params *p, 
 			  spdk_bs_op_complete cb_fn, void *cb_arg)
 {
-	if (token_rate == 0) {
-		SPDK_ERRLOG("Invalid token rate: %lu\n", token_rate);
+	if (!p->token_rate || !p->rd_only_token_rate || !p->write_factor) {
+		SPDK_ERRLOG("Invalid params\n");
 		cb_fn(cb_arg, -EINVAL);
 		return;
 	}
 
-	bs->dev_token_rate = token_rate;
+	bs->token_rate = p->token_rate * 1000;
+	bs->rd_only_token_rate = p->rd_only_token_rate * 1000;
+	bs->write_factor = p->write_factor;
+
 	cb_fn(cb_arg, 0);
 }
 
 static int
 bs_token_generate(void *arg)
 {
+	static uint64_t prev_ticks = 0;
+	uint64_t cur_ticks = spdk_get_ticks();
 	struct spdk_blob_store *bs = arg;
 	token_tenant *tenant;
 
+	/* measured in seconds */
+	uint64_t time_delta = (cur_ticks - prev_ticks) / spdk_get_ticks_hz();
+
 	TAILQ_FOREACH(tenant, &bs->tenants, link) {
-		/* TODO: fulfill tenant tokens */
+		tenant->tokens += time_delta * tenant->scaledIOPS;
+		tenant->tokens = spdk_min(tenant->tokens, tenant->scaledIOPS);
 	}
+
+	prev_ticks = cur_ticks;
 
 	return SPDK_POLLER_BUSY;
 }
@@ -2251,11 +2394,15 @@ spdk_bs_register_tenant(struct spdk_blob_store *bs, spdk_bs_tenant_opts *o,
 		}
 	}
 
+	/* TODO: calculate weighted IOPS */
+	tenant->scaledIOPS = 0;
+
 	TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
 
-	cb_fn(cb_arg, 0);
+	if (cb_fn) {
+		cb_fn(cb_arg, 0);
+	}
 }
-/* END OF CLUSTER RECLAIM */
 
 static void
 blob_verify_md_op(struct spdk_blob *blob)

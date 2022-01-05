@@ -997,7 +997,13 @@ void spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **inf
 void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 uint64_t spdk_blob_ref_cnt(struct spdk_blob *snap);
 
-void spdk_bs_set_token_rate(struct spdk_blob_store *bs, uint64_t token_rate, 
+typedef struct {
+	uint32_t token_rate;
+	uint32_t rd_only_token_rate;
+	uint32_t write_factor;
+} spdk_bs_params;
+
+void spdk_bs_set_params(struct spdk_blob_store *bs, spdk_bs_params *p, 
 			  spdk_bs_op_complete cb_fn, void *cb_arg);
 typedef struct {
 	uint32_t latency;
