@@ -130,7 +130,7 @@ struct spdk_lvol *vbdev_lvol_get_from_bdev(struct spdk_bdev *bdev);
 void vbdev_lvol_get_lvs_mask(struct spdk_lvol_store *lvs, enum lvs_mask_type type, 
 				spdk_lvs_op_complete cb_fn, void *cb_arg);
 
-void vbdev_lvol_mark_snapshot_hidden(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+void vbdev_lvol_hide_snapshot(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 struct rpc_bdev_lvol_get_lvs_mask_cb_arg {
 	struct spdk_jsonrpc_request *request;
