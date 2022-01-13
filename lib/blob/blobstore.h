@@ -100,8 +100,6 @@ struct blob_io_ctx {
 		int err;
 	} split_io_ctx;
 	struct {
-		/* the thread that hanlde IO */
-		struct spdk_thread *thread;
 		/* new allocated md */
 		uint64_t new_cluster;
 		uint32_t new_extent_page;

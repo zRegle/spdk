@@ -163,7 +163,7 @@ bs_mem_pool_init(struct spdk_blob_store *bs, enum buf_type type, uint32_t pool_s
 			return -ENOMEM;
 		}
 		/* allocate DMA buffer */
-		ele->buf = spdk_malloc(buf_size, 0, NULL, 
+		ele->buf = spdk_zmalloc(buf_size, 0x1000, NULL, 
 					SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (ele->buf == NULL) {
 			SPDK_ERRLOG("spdk_malloc failed\n");
@@ -976,9 +976,8 @@ blob_cow_update_snapshot_ref(struct blob_io_ctx *ctx)
 }
 
 static void
-blob_cow_persist_valid_slices_cpl(void *arg)
+blob_cow_persist_valid_slices_cpl(struct blob_io_ctx *ctx)
 {
-	struct blob_io_ctx *ctx = arg;
 	struct spdk_blob *blob = ctx->blob;
 	struct cow_sequencer *sequencer;
 	struct cow_sequencer_list_node *node;
@@ -1013,13 +1012,12 @@ blob_cow_persist_valid_slices_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 
 	bs_mem_factory_put(ctx->blob->bs, ctx->cow_ctx.ele);
 
-	spdk_thread_send_msg(ctx->cow_ctx.thread, blob_cow_persist_valid_slices_cpl, ctx);
+	blob_cow_persist_valid_slices_cpl(ctx);
 }
 
 static void
-blob_cow_persist_valid_slices(void *arg)
+blob_cow_persist_valid_slices(struct blob_io_ctx *ctx)
 {
-	struct blob_io_ctx *ctx = arg;
 	struct spdk_blob *blob = ctx->blob;
 	uint64_t phy_slice;
 	uint32_t md_page;
@@ -1077,8 +1075,7 @@ blob_slice_write_copy_cpl(spdk_bs_sequence_t *sequence, void *cb_arg, int bserrn
 	}
 
 	ctx->cow_ctx.ele = buf;
-	ctx->cow_ctx.thread = spdk_get_thread();
-	spdk_thread_send_msg(blob->bs->md_thread, blob_cow_persist_valid_slices, ctx);
+	blob_cow_persist_valid_slices(ctx);
 }
 
 
