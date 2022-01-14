@@ -17,25 +17,7 @@ then
     device=$(cat $SCRIPTS/base_dev)
     if [ -b $device ];
     then
-        if [ $device == '/dev/mapper/dm0' ];
-        then
-            # reset dm-table
-            md_bytes=`cat $SCRIPTS/md_bytes`
-            sed -i "s/$md_bytes/md/g" $SCRIPTS/dm-table
-        fi
         dd if=/dev/zero of=$device bs=1M count=128 &> /dev/null
         echo "clear md"
-
-        if [ $device == '/dev/mapper/dm0' ];
-        then
-            sleep 3
-            # remove linear device
-            dmsetup remove dm0
-            if [ $? -ne 0 ];
-            then
-                echo "dmsetup remove failed"
-                exit 1
-            fi
-        fi
     fi
 fi
