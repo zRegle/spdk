@@ -218,11 +218,7 @@ rpc_bdev_get_iostat_cb(struct spdk_bdev *bdev,
 
 		spdk_json_write_named_uint64(w, "read_latency_ticks", stat->read_latency_ticks);
 
-		spdk_json_write_string_fmt(w, "read_latency_ticks_avg: %.3f", (float)stat->read_latency_ticks / stat->num_read_ops);
-
 		spdk_json_write_named_uint64(w, "write_latency_ticks", stat->write_latency_ticks);
-
-		spdk_json_write_string_fmt(w, "write_latency_ticks_avg: %.3f", (float)stat->write_latency_ticks / stat->num_write_ops);
 
 		spdk_json_write_named_uint64(w, "unmap_latency_ticks", stat->unmap_latency_ticks);
 
