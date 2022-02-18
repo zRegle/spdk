@@ -71,6 +71,7 @@
 struct cow_sequencer;
 struct mapping_sequencer;
 
+#define COW_PERSIST_VALID_SLICES_PAGE_MAX 128
 struct blob_io_ctx {
 	struct spdk_blob *blob;
 	struct spdk_io_channel *channel;
@@ -107,8 +108,10 @@ struct blob_io_ctx {
 		struct blob_io_buf *merge_buf[2];
 		spdk_bs_sequence_t *seq;
 		/* valid_slices buffer */
-		struct blob_io_buf *ele;
+		struct blob_io_buf *eles[COW_PERSIST_VALID_SLICES_PAGE_MAX];
 		bool need_merge_data;
+		int bserrno;
+		uint32_t outstanding_md_ops;
 	} cow_ctx;
 	uint64_t start_slice;
 	uint64_t end_slice;
