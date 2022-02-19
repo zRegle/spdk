@@ -80,6 +80,7 @@ enum lvs_mask_type {
 struct spdk_lvs_opts {
 	uint32_t		cluster_sz;
 	uint32_t		slice_sz;
+	double			write_factor;
 	enum lvs_clear_method	clear_method;
 	char			name[SPDK_LVS_NAME_MAX];
 };

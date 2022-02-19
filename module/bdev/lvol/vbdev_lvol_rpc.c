@@ -46,6 +46,7 @@ struct rpc_bdev_lvol_create_lvstore {
 	uint32_t cluster_sz;
 	uint32_t slice_sz;
 	char *clear_method;
+	char *write_factor;
 };
 
 static int
@@ -84,6 +85,7 @@ free_rpc_bdev_lvol_create_lvstore(struct rpc_bdev_lvol_create_lvstore *req)
 	free(req->bdev_name);
 	free(req->lvs_name);
 	free(req->clear_method);
+	free(req->write_factor);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_create_lvstore_decoders[] = {
@@ -92,6 +94,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_lvstore_decode
 	{"slice_sz", offsetof(struct rpc_bdev_lvol_create_lvstore, slice_sz), spdk_json_decode_uint32, true},
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create_lvstore, lvs_name), spdk_json_decode_string},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create_lvstore, clear_method), spdk_json_decode_string, true},
+	{"write_factor", offsetof(struct rpc_bdev_lvol_create_lvstore, write_factor), spdk_json_decode_string, true},
 };
 
 static void
@@ -124,6 +127,7 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_lvol_create_lvstore req = {};
 	int rc = 0;
 	enum lvs_clear_method clear_method;
+	double write_factor = 0.0f;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_create_lvstore_decoders,
 				    SPDK_COUNTOF(rpc_bdev_lvol_create_lvstore_decoders),
@@ -149,8 +153,13 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 		clear_method = LVS_CLEAR_WITH_UNMAP;
 	}
 
-	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, req.slice_sz, clear_method,
-			      rpc_lvol_store_construct_cb, request);
+	if (req.write_factor != NULL) {
+		write_factor = atof(req.write_factor);
+	}
+
+	/* TODO: persist write factor to super blob */
+	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, req.slice_sz, write_factor,
+				  clear_method, rpc_lvol_store_construct_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, -rc, spdk_strerror(rc));
 		goto cleanup;

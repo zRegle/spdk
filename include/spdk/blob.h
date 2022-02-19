@@ -248,6 +248,9 @@ struct spdk_bs_opts {
 	/** Size of slice in bytes. Must be multiple of 4KiB page size. */
 	uint32_t slice_sz;
 
+	/* write factor of NVMe SSD */
+	double write_factor;
+
 	/** Count of the number of pages reserved for metadata */
 	uint32_t num_md_pages;
 
@@ -503,6 +506,7 @@ struct spdk_blob_opts {
 	 * New added fields should be put at the end of the struct.
 	 */
 	size_t opts_size;
+	bool init_reclaim;
 };
 
 /**
@@ -691,6 +695,7 @@ struct spdk_blob_open_opts {
 	 * New added fields should be put at the end of the struct.
 	 */
 	size_t opts_size;
+	bool init_reclaim;
 };
 
 /**

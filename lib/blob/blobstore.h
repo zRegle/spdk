@@ -50,6 +50,7 @@
 
 #define SPDK_BLOB_OPTS_CLUSTER_SZ (1024 * 1024)
 #define SPDK_BLOB_OPTS_SLICE_SZ (64 * 1024)
+#define SPDK_BLOB_OPTS_WRITE_FACTOR 0
 #define SPDK_BLOB_OPTS_NUM_MD_PAGES UINT32_MAX
 #define SPDK_BLOB_OPTS_MAX_MD_OPS 32
 #define SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS 512
@@ -334,6 +335,7 @@ struct spdk_blob {
 	struct rb_root cluster_sequencers_tree;
 	struct rb_root slice_sequencers_tree;
 	uint64_t total_ref_cnt;
+	bool init_reclaim;
 };
 
 struct spdk_blob_store {
@@ -391,6 +393,7 @@ struct spdk_blob_store {
 	uint32_t write_factor;
 	TAILQ_HEAD(, token_tenant) tenants;
 	struct spdk_poller *token_generator;
+	bool reclaim_inited;
 #ifdef DEBUG
 	blob_io_statistics slice;
 	blob_io_statistics cluster;
@@ -616,8 +619,9 @@ struct spdk_bs_super_block {
 
 	uint64_t        size; /* size of blobstore in bytes */
 	uint32_t        io_unit_size; /* Size of io unit in bytes */
+	double		write_factor;
 
-	uint8_t         reserved[3980];
+	uint8_t         reserved[3972];
 	uint32_t	crc;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super block size");

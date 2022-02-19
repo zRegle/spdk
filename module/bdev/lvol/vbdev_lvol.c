@@ -231,7 +231,7 @@ end:
 }
 
 int
-vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_sz, uint32_t slice_sz,
+vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_sz, uint32_t slice_sz, double write_factor,
 		 enum lvs_clear_method clear_method, spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_dev *bs_dev;
@@ -252,6 +252,10 @@ vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_
 
     if (slice_sz != 0) {
 		opts.slice_sz = slice_sz;
+	}
+
+	if (write_factor != 0) {
+		opts.write_factor = write_factor;
 	}
 
 	if (clear_method != 0) {

@@ -149,6 +149,7 @@ spdk_lvol_open(struct spdk_lvol *lvol, spdk_lvol_op_with_handle_complete cb_fn, 
 
 	spdk_blob_open_opts_init(&opts, sizeof(opts));
 	opts.clear_method = lvol->clear_method;
+	opts.init_reclaim = true;
 
 	spdk_bs_open_blob_ext(lvol->lvol_store->blobstore, lvol->blob_id, &opts, lvol_open_cb, req);
 }
@@ -575,6 +576,7 @@ setup_lvs_opts(struct spdk_bs_opts *bs_opts, struct spdk_lvs_opts *o)
 	lvs_bs_opts_init(bs_opts);
 	bs_opts->cluster_sz = o->cluster_sz;
 	bs_opts->slice_sz = o->slice_sz;
+	bs_opts->write_factor = o->write_factor;
 	bs_opts->clear_method = (enum bs_clear_method)o->clear_method;
 }
 

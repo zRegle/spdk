@@ -2088,6 +2088,7 @@ bs_reclaim_cluster_get_next(reclaim_cluster_ctx *ctx, struct spdk_blob_store *bs
 }
 
 #define ITER_NEXT_CLUSTER 1
+#define BLOB_NOT_READY 2
 
 static int
 bs_reclaim_cluster_get_next_clone(struct cluster_to_reclaim *target, struct spdk_blob **next)
@@ -2136,10 +2137,12 @@ bs_reclaim_cluster_get_next_clone(struct cluster_to_reclaim *target, struct spdk
 	}
 
 	*next = blob_lookup(snap->bs, next_id);
-	assert(next != NULL);
-	target->cur_child = (*next)->id;
-
-	return 0;
+	if (*next == NULL) {
+		return BLOB_NOT_READY;
+	} else {
+		target->cur_child = (*next)->id;
+		return 0;
+	}
 }
 
 static void
@@ -2317,7 +2320,6 @@ void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn
 {
 	struct spdk_blob_store *bs = blob->bs;
 	struct cluster_to_reclaim *node;
-	static bool first = true;
 	uint32_t cluster_ref;
 	uint64_t i, j;
 	int rc;
@@ -2327,14 +2329,14 @@ void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn
 	/* temporaily unset read-only */
 	blob->md_ro = false;
 
-	rc = blob_set_xattr(blob, "SNAPHID", "true", strlen("true"), true);
+	rc = blob_set_xattr(blob, "SNAPHID", "true", strlen("true"), false);
 	if (rc < 0) {
 		goto exit;
 	}
 
 	blob->md_ro = true;
 
-	if (first) {
+	if (!bs->reclaim_inited) {
 		rc = bs_init_background_reclaim(bs);
 		if (rc < 0) {
 			goto exit;
@@ -5698,6 +5700,7 @@ spdk_bs_opts_init(struct spdk_bs_opts *opts, size_t opts_size)
 
 	SET_FIELD(cluster_sz, SPDK_BLOB_OPTS_CLUSTER_SZ);
 	SET_FIELD(slice_sz, SPDK_BLOB_OPTS_SLICE_SZ);
+	SET_FIELD(write_factor, SPDK_BLOB_OPTS_WRITE_FACTOR);
 	SET_FIELD(num_md_pages, SPDK_BLOB_OPTS_NUM_MD_PAGES);
 	SET_FIELD(max_md_ops, SPDK_BLOB_OPTS_NUM_MD_PAGES);
 	SET_FIELD(max_channel_ops, SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS);
@@ -5834,6 +5837,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	bs->valid_slices = spdk_bit_array_create(1);
 	bs->pages_per_slice = bs->slice_sz / SPDK_BS_PAGE_SIZE;
 	bs->num_valid_slices = 0;
+	bs->write_factor = opts->write_factor;
 
 	bs->pages_per_cluster = bs->cluster_sz / SPDK_BS_PAGE_SIZE;
 	if (spdk_u32_is_pow2(bs->pages_per_cluster)) {
@@ -5887,6 +5891,7 @@ exit:
 	spdk_free(ctx->super);
 	free(ctx);
 	bs_mem_factory_destroy(bs);
+	spdk_poller_unregister(&bs->token_generator);
 	free(bs);
 	/* FIXME: this is a lie but don't know how to get a proper error code here */
 	return -ENOMEM;
@@ -7009,6 +7014,7 @@ bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->bs->slices_per_cluster = ctx->bs->cluster_sz / ctx->bs->slice_sz;
 	ctx->bs->total_slices = ctx->bs->total_clusters * ctx->bs->slices_per_cluster;
 	ctx->bs->pages_per_slice = ctx->bs->slice_sz / SPDK_BS_PAGE_SIZE;
+	ctx->bs->write_factor = ctx->super->write_factor;
 
 	num_md_clusters = ctx->bs->total_clusters - ctx->bs->total_data_clusters;
 	ctx->bs->num_valid_slices = num_md_clusters * ctx->bs->slices_per_cluster;
@@ -7039,6 +7045,7 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 
 	SET_FIELD(cluster_sz);
 	SET_FIELD(slice_sz);
+	SET_FIELD(write_factor);
 	SET_FIELD(num_md_pages);
 	SET_FIELD(max_md_ops);
 	SET_FIELD(max_channel_ops);
@@ -7054,7 +7061,7 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 64, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 72, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -7516,6 +7523,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	ctx->super->clean = 0;
 	ctx->super->cluster_size = bs->cluster_sz;
 	ctx->super->slice_size = bs->slice_sz;
+	ctx->super->write_factor = bs->write_factor;
 	ctx->super->io_unit_size = bs->io_unit_size;
 	memcpy(&ctx->super->bstype, &bs->bstype, sizeof(bs->bstype));
 
@@ -8134,6 +8142,7 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 	SET_FIELD(num_clusters);
 	SET_FIELD(thin_provision);
 	SET_FIELD(clear_method);
+	SET_FIELD(init_reclaim);
 
 	if (FIELD_OK(xattrs)) {
 		memcpy(&dst->xattrs, &src->xattrs, sizeof(src->xattrs));
@@ -8145,7 +8154,7 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 64, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 72, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -9782,6 +9791,13 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob *blob = cb_arg;
 	struct spdk_blob *existing;
+	bool *hide;
+	size_t value_len;
+	int rc;
+	uint64_t i, j;
+	uint32_t cluster_ref;
+	struct spdk_blob_store *bs = blob->bs;
+	struct cluster_to_reclaim *node;
 
 	if (bserrno != 0) {
 		blob_free(blob);
@@ -9804,6 +9820,43 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	spdk_bit_array_set(blob->bs->open_blobids, blob->id);
 	TAILQ_INSERT_HEAD(&blob->bs->blobs, blob, link);
 
+	if (blob->init_reclaim) {
+		if (bs->reclaim_inited == false) {
+			rc = bs_init_background_reclaim(bs);
+			if (rc) {
+				goto exit;
+			}
+			bs->reclaim_inited = true;
+		}
+		rc = spdk_blob_get_xattr_value(blob, "SNAPHID", (const void **)&hide, &value_len);
+		if (rc == 0) {
+			for (i = 0; i < blob->active.num_clusters; i++) {
+				if (blob->active.clusters[i] == 0) continue;
+				cluster_ref = blob->active.ref_cnt[i];
+
+				node = calloc(1, sizeof(*node));
+				if (node == NULL) {
+					rc = -ENOMEM;
+					goto exit;
+				}
+				node->blob = blob;
+				node->cluster_idx = i;
+				node->cur_child = SPDK_BLOBID_INVALID;
+
+				for (j = 0; j < QUEUE_CNT; j++) {
+					if (cluster_ref <= bs->queues[j]->upper_bound) {
+						TAILQ_INSERT_TAIL(&bs->queues[j]->list, node, link);
+						break;
+					}
+				}
+				if (cluster_ref > HIGH_UPPER_BOUND) {
+					TAILQ_INSERT_TAIL(&bs->queues[SUPER_HIGH]->list, node, link);
+				}
+			}
+		}
+	}
+
+exit:
 	bs_sequence_finish(seq, bserrno);
 }
 
@@ -9819,12 +9872,13 @@ blob_open_opts_copy(const struct spdk_blob_open_opts *src, struct spdk_blob_open
         } \
 
 	SET_FIELD(clear_method);
+	dst->init_reclaim = src->init_reclaim;
 
 	dst->opts_size = src->opts_size;
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_open_opts) == 16, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_open_opts) == 24, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -9872,6 +9926,7 @@ bs_open_blob(struct spdk_blob_store *bs,
 	}
 
 	blob->clear_method = opts_local.clear_method;
+	blob->init_reclaim = opts_local.init_reclaim;
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_HANDLE;
 	cpl.u.blob_handle.cb_fn = cb_fn;
