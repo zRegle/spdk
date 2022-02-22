@@ -72,6 +72,11 @@
 struct cow_sequencer;
 struct mapping_sequencer;
 
+enum io_tag {
+	RESOURCE_RECLAIM,
+	COMMON,
+};
+
 #define COW_PERSIST_VALID_SLICES_PAGE_MAX 128
 struct blob_io_ctx {
 	struct spdk_blob *blob;
@@ -118,6 +123,7 @@ struct blob_io_ctx {
 	uint64_t end_slice;
 	bool begin_aligned;
 	bool end_aligned;
+	enum io_tag tag;
 #ifdef DEBUG
 	struct {
 		struct timespec ts;
@@ -199,6 +205,7 @@ typedef struct{
 } SLO;
 
 struct token_tenant {
+	pthread_mutex_t token_lock;
 	uint64_t tokens;
 	SLO slo;
 	uint32_t scaledIOPS;
@@ -394,6 +401,7 @@ struct spdk_blob_store {
 	TAILQ_HEAD(, token_tenant) tenants;
 	struct spdk_poller *token_generator;
 	bool reclaim_inited;
+	uint64_t resource_reclaim_cnt;
 #ifdef DEBUG
 	blob_io_statistics slice;
 	blob_io_statistics cluster;

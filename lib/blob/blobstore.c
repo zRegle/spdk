@@ -77,6 +77,11 @@ blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint6
 				 uint64_t *lba,	uint32_t *lba_count);
 static struct spdk_blob* blob_lookup(struct spdk_blob_store *bs, spdk_blob_id blobid);
 static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+static void bs_tenant_put_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand, enum io_tag tag);
+static void bs_tenant_get_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand, enum io_tag tag);
+static bool bs_tenant_io_control(struct spdk_blob_store *bs, uint64_t tokens_demand, enum io_tag tag);
+static inline uint32_t
+bs_compute_request_cost(struct spdk_blob_store *bs, uint32_t size, enum spdk_blob_op_type type);
 
 #define SLICES_PER_PAGE (SPDK_BS_PAGE_SIZE * CHAR_BIT)
 #define SLICE_MASK_HEADER (sizeof(struct spdk_bs_md_mask) * CHAR_BIT)
@@ -84,7 +89,8 @@ static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, vo
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
 // #define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
 #define TOKEN_GENERATE_PERIOD 1000
-#define RECLAIM_TOKENS ((110000))
+#define RECLAIM_TOKENS ((110 * 1000))
+#define COMMON_TOKENS ((240 * 1000))
 #define READ_TOKEN 10
 
 enum slice_status {
@@ -710,7 +716,7 @@ blob_free_io_ctx(struct blob_io_ctx *ctx)
 static struct blob_io_ctx*
 blob_io_ctx_init(struct spdk_blob *blob, struct spdk_io_channel *channel, 
 				struct iovec *iovs, int iovcnt, uint64_t offset, uint64_t length, 
-				spdk_blob_op_complete cb_fn, void *cb_arg, bool read)
+				spdk_blob_op_complete cb_fn, void *cb_arg, bool read, enum io_tag tag)
 {
 	struct blob_io_ctx *ctx;
 	uint64_t io_unit_per_slice;
@@ -723,6 +729,7 @@ blob_io_ctx_init(struct spdk_blob *blob, struct spdk_io_channel *channel,
 
 	io_unit_per_slice = bs_io_unit_per_page(blob->bs) * blob->bs->pages_per_slice;
 
+	ctx->tag = tag;
 	ctx->blob = blob;
 	ctx->channel = channel;
 	ctx->offset = offset;
@@ -1515,7 +1522,7 @@ blob_slice_split_io(struct blob_io_ctx *parent, uint64_t sub_offset,
 	assert(parent != NULL);
 
 	child = blob_io_ctx_init(blob, parent->channel, parent->iovs, parent->iovcnt,
-					sub_offset, sub_len, blob_subio_done, parent, parent->read);
+					sub_offset, sub_len, blob_subio_done, parent, parent->read, parent->tag);
 	if (child == NULL) {
 		SPDK_ERRLOG("calloc failed\n");
 		return NULL;
@@ -1647,7 +1654,7 @@ error:
 static void
 blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			   struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
-			   spdk_blob_op_complete cb_fn, void *cb_arg, bool read)
+			   spdk_blob_op_complete cb_fn, void *cb_arg, bool read, enum io_tag tag)
 {
 	struct blob_io_ctx *ctx;
 	struct mapping_sequencer *sequencer;
@@ -1656,7 +1663,7 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 	int rc;
 
 	ctx = blob_io_ctx_init(blob, _channel, iov, iovcnt, 
-					offset, length, cb_fn, cb_arg, read);
+					offset, length, cb_fn, cb_arg, read, tag);
 	if (ctx == NULL) {
 		cb_fn(cb_arg, -ENOMEM);
 		return;
@@ -1784,6 +1791,7 @@ blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
 		}
 		/* iter */
 		// bs_reclaim_cluster_iter(ctx, bserrno);
+		printf("resource reclaim cnt %lu\n", ++snap->bs->resource_reclaim_cnt);
 
 		if (snap->active.ref_cnt[target->cluster_idx] == 0) {
 			/* ref_cnt is zero, no need to copy data anymore
@@ -1811,13 +1819,19 @@ bs_compute_request_cost(struct spdk_blob_store *bs, uint32_t size, enum spdk_blo
 }
 
 static void
-bs_resource_get_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand)
+bs_tenant_get_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand, enum io_tag tag)
 {
 	token_tenant *t;
 
 	TAILQ_FOREACH(t, &bs->tenants, link) {
-		if (strcasecmp(t->name, "resource-reclaimer") == 0) {
-			break;
+		if (tag == RESOURCE_RECLAIM) {
+			if (strcasecmp(t->name, "resource-reclaimer") == 0) {
+				break;
+			}
+		} else {
+			if (strcasecmp(t->name, "common") == 0) {
+				break;
+			}
 		}
 	}
 
@@ -1827,19 +1841,27 @@ bs_resource_get_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand)
 }
 
 static void
-bs_resource_put_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand)
+bs_tenant_put_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand, enum io_tag tag)
 {
 	token_tenant *t;
 
 	TAILQ_FOREACH(t, &bs->tenants, link) {
-		if (strcasecmp(t->name, "resource-reclaimer") == 0) {
-			break;
+		if (tag == RESOURCE_RECLAIM) {
+			if (strcasecmp(t->name, "resource-reclaimer") == 0) {
+				break;
+			}
+		} else {
+			if (strcasecmp(t->name, "common") == 0) {
+				break;
+			}
 		}
 	}
 
 	assert(t != NULL);
+	pthread_mutex_lock(&t->token_lock);
 	t->tokens += tokens_demand;
 	t->tokens = spdk_min(t->scaledIOPS, t->tokens);
+	pthread_mutex_unlock(&t->token_lock);
 }
 
 static void
@@ -1851,25 +1873,40 @@ blob_touch_cluster_write_cpl(void *cb_arg, int bserrno)
 	
 	request_bytes = ctx->length * bs->io_unit_size;
 	token_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_WRITEV);
-	bs_resource_put_tokens(bs, token_demand);
+	bs_tenant_put_tokens(bs, token_demand, RESOURCE_RECLAIM);
 
 	bs_sequence_finish(ctx->seq, bserrno);
 	free_touch_cluster_ctx(ctx);
 }
 
 static inline bool
-bs_resource_reclaim_op_control(struct spdk_blob_store *bs, uint64_t tokens_demand)
+bs_tenant_io_control(struct spdk_blob_store *bs, uint64_t tokens_demand, enum io_tag tag)
 {
 	token_tenant *t;
+	bool flag;
 
 	TAILQ_FOREACH(t, &bs->tenants, link) {
-		if (strcasecmp(t->name, "resource-reclaimer") == 0) {
-			break;
+		if (tag == RESOURCE_RECLAIM) {
+			if (strcasecmp(t->name, "resource-reclaimer") == 0) {
+				break;
+			}
+		} else {
+			if (strcasecmp(t->name, "common") == 0) {
+				break;
+			}
 		}
 	}
 
 	assert(t != NULL);
-	return t->tokens >= tokens_demand;
+	pthread_mutex_lock(&t->token_lock);
+	if (t->tokens >= tokens_demand) {
+		t->tokens -= tokens_demand;
+		flag = true;
+	} else {
+		flag = false;
+	}
+	pthread_mutex_unlock(&t->token_lock);
+	return flag;
 }
 
 static void
@@ -1886,7 +1923,7 @@ blob_touch_cluster_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	
 	request_bytes = bs->slice_sz * count;
 	tokens_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_READV);
-	bs_resource_put_tokens(bs, tokens_demand);
+	bs_tenant_put_tokens(bs, tokens_demand, RESOURCE_RECLAIM);
 
 	if (bserrno != 0) {
 		bs_sequence_finish(seq, bserrno);
@@ -1908,17 +1945,15 @@ blob_touch_cluster_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	/* valid slices md page */
 	tokens_demand += bs_compute_request_cost(bs, SPDK_BS_PAGE_SIZE, SPDK_BLOB_WRITEV);
 
-	if (!bs_resource_reclaim_op_control(bs, tokens_demand)) {
+	if (!bs_tenant_io_control(bs, tokens_demand, RESOURCE_RECLAIM)) {
 		bs_sequence_finish(seq, -EACCES);
 		free_touch_cluster_ctx(ctx);
 		return;
-	} else {
-		bs_resource_get_tokens(bs, tokens_demand);
 	}
 
 	/* FIXME: may overwrite user's data */
-	blob_start_io(clone, channel, ctx->iov, ctx->iovcnt,
-				ctx->offset, ctx->length, blob_touch_cluster_write_cpl, ctx, false);
+	blob_start_io(clone, channel, ctx->iov, ctx->iovcnt, ctx->offset, ctx->length, 
+				blob_touch_cluster_write_cpl, ctx, false, RESOURCE_RECLAIM);
 }
 
 static void
@@ -1935,10 +1970,8 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 	request_bytes = bs->slice_sz * count;
 	tokens_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_READV);
 
-	if (!bs_resource_reclaim_op_control(bs, tokens_demand)) {
+	if (!bs_tenant_io_control(bs, tokens_demand, RESOURCE_RECLAIM)) {
 		goto exit;
-	} else {
-		bs_resource_get_tokens(bs, tokens_demand);
 	}
 
 	tctx = calloc(1, sizeof(*tctx));
@@ -2421,6 +2454,8 @@ spdk_bs_register_tenant(struct spdk_blob_store *bs, spdk_bs_tenant_opts *o,
 			  spdk_bs_op_complete cb_fn, void *cb_arg)
 {
 	token_tenant *tenant;
+	uint64_t weighted_IOPS;
+	double read_ratio;
 
 	tenant = calloc(1, sizeof(*tenant));
 	if (tenant == NULL) {
@@ -2428,13 +2463,16 @@ spdk_bs_register_tenant(struct spdk_blob_store *bs, spdk_bs_tenant_opts *o,
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
+	pthread_mutex_init(&tenant->token_lock, NULL);
 
 	tenant->slo.latency = o->latency;
 	tenant->slo.iops = o->iops;
 	tenant->slo.read_ratio = o->read_ratio;
 
-	/* TODO: calculate weighted IOPS */
-	tenant->scaledIOPS = 0;
+	read_ratio = (double)o->read_ratio / 100;
+	weighted_IOPS = o->iops * READ_TOKEN * 1000 * 
+			  (read_ratio + (1-read_ratio) * bs->write_factor);
+	tenant->tokens = tenant->scaledIOPS = weighted_IOPS;
 
 	TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
 
@@ -5413,7 +5451,7 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 			return;
 		}
 
-		blob_start_io(blob, _channel, iov, iovcnt, offset, length, cb_fn, cb_arg, read);
+		blob_start_io(blob, _channel, iov, iovcnt, offset, length, cb_fn, cb_arg, read, COMMON);
 	} else {
 		struct rw_iov_ctx *ctx;
 
@@ -5550,6 +5588,7 @@ bs_dev_destroy(void *io_device)
 {
 	struct spdk_blob_store *bs = io_device;
 	struct spdk_blob	*blob, *blob_tmp;
+	token_tenant *tenant, *ttmp;
 
 	bs->dev->destroy(bs->dev);
 
@@ -5575,6 +5614,12 @@ bs_dev_destroy(void *io_device)
 
 	bs_mem_factory_destroy(bs);
 	spdk_poller_unregister(&bs->token_generator);
+	spdk_poller_unregister(&bs->reclaim_poller);
+	TAILQ_FOREACH_SAFE(tenant, &bs->tenants, link, ttmp) {
+		TAILQ_REMOVE(&bs->tenants, tenant, link);
+		pthread_mutex_destroy(&tenant->token_lock);
+		free(tenant);
+	}
 
 	free(bs);
 }
@@ -5876,6 +5921,17 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 		SPDK_ERRLOG("register poller failed\n");
 		goto exit;
 	}
+
+	token_tenant *tenant;
+	tenant = calloc(1, sizeof(*tenant));
+	if (tenant == NULL) {
+		goto exit;
+	}
+	pthread_mutex_init(&tenant->token_lock, NULL);
+	tenant->name = "common";
+	tenant->tokens = COMMON_TOKENS;
+	tenant->scaledIOPS = COMMON_TOKENS;
+	TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
 
 	*_ctx = ctx;
 	*_bs = bs;
@@ -9823,6 +9879,7 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	if (blob->init_reclaim) {
 		if (bs->reclaim_inited == false) {
+			printf("background reclaim init\n");
 			rc = bs_init_background_reclaim(bs);
 			if (rc) {
 				goto exit;
