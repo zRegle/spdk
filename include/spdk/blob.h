@@ -69,7 +69,7 @@ extern "C" {
 typedef uint64_t spdk_blob_id;
 #define SPDK_BLOBID_INVALID	(uint64_t)-1
 #define SPDK_BLOBSTORE_TYPE_LENGTH 16
-#define RECLAIM_POLL_INTERVAL (1000)
+#define RECLAIM_POLL_INTERVAL (120 * 1000)
 
 enum blob_clear_method {
 	BLOB_CLEAR_WITH_DEFAULT,

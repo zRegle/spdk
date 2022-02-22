@@ -84,7 +84,7 @@ static void blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, vo
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
 // #define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
 #define TOKEN_GENERATE_PERIOD 1000
-#define RECLAIM_TOKENS ((10240 + 20480) * 50)
+#define RECLAIM_TOKENS ((110000))
 #define READ_TOKEN 10
 
 enum slice_status {
@@ -913,9 +913,9 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 
 #ifdef DEBUG
 	float total = ctx->statistics.read + ctx->statistics.write + ctx->statistics.md;
-	printf("offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
-				ctx->offset, ctx->length, TAILQ_FIRST(&ctx->sequencers)->seq->slice,
-				ctx->statistics.read, ctx->statistics.write, ctx->statistics.md, total);
+	// printf("offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
+	// 			ctx->offset, ctx->length, TAILQ_FIRST(&ctx->sequencers)->seq->slice,
+	// 			ctx->statistics.read, ctx->statistics.write, ctx->statistics.md, total);
 	
 	struct spdk_blob_store *bs = ctx->blob->bs;
 	bs->slice.cnt++;
@@ -1776,11 +1776,14 @@ blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
 	ctx->outstanding_ops--;
 
 	if (ctx->outstanding_ops == 0) {
-		if (bserrno == 0) {
+		if (bserrno != 0) {
 			/* TODO: error handle */
+			ctx->current->on_process = false;
+			free(ctx);
+			return;
 		}
 		/* iter */
-		bs_reclaim_cluster_iter(ctx, bserrno);
+		// bs_reclaim_cluster_iter(ctx, bserrno);
 
 		if (snap->active.ref_cnt[target->cluster_idx] == 0) {
 			/* ref_cnt is zero, no need to copy data anymore
@@ -1819,7 +1822,7 @@ bs_resource_get_tokens(struct spdk_blob_store *bs, uint64_t tokens_demand)
 	}
 
 	assert(t != NULL);
-	assert(t->tokens > tokens_demand);
+	assert(t->tokens >= tokens_demand);
 	t->tokens -= tokens_demand;
 }
 
@@ -1866,7 +1869,7 @@ bs_resource_reclaim_op_control(struct spdk_blob_store *bs, uint64_t tokens_deman
 	}
 
 	assert(t != NULL);
-	return t->tokens > tokens_demand;
+	return t->tokens >= tokens_demand;
 }
 
 static void
@@ -1928,13 +1931,11 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 	struct spdk_io_channel *channel;
 	uint32_t i;
 	uint64_t tokens_demand, request_bytes;
-	int rc = 0;
 
 	request_bytes = bs->slice_sz * count;
 	tokens_demand = bs_compute_request_cost(bs, request_bytes, SPDK_BLOB_READV);
 
 	if (!bs_resource_reclaim_op_control(bs, tokens_demand)) {
-		rc = -EACCES;
 		goto exit;
 	} else {
 		bs_resource_get_tokens(bs, tokens_demand);
@@ -1942,7 +1943,6 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 
 	tctx = calloc(1, sizeof(*tctx));
 	if (tctx == NULL) {
-		rc = -ENOMEM;
 		goto exit;
 	}
 	tctx->clone = clone;
@@ -1951,7 +1951,6 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 
 	tctx->iov = calloc(1, sizeof(*tctx->iov));
 	if (tctx->iov == NULL) {
-		rc = -ENOMEM;
 		goto exit;
 	}
 	tctx->iovcnt = 1;
@@ -1960,13 +1959,11 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 	tctx->iov->iov_base = spdk_malloc(tctx->iov->iov_len, 0, NULL, 
 				SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (tctx->iov->iov_base == NULL) {
-		rc = -ENOMEM;
 		goto exit;
 	}
 
 	tctx->sequencers = calloc(count, sizeof(*tctx->sequencers));
 	if (tctx->sequencers == NULL) {
-		rc = -ENOMEM;
 		goto exit;
 	}
 
@@ -1976,7 +1973,6 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 		assert(tctx->sequencers[i] != NULL);
 		if (tctx->sequencers[i]->cow_io) {
 			/* cow active, just wait for the next time */
-			rc = -EBUSY;
 			goto exit;
 		}
 		/* read count plus one, block cow */
@@ -1985,7 +1981,6 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 
 	channel = spdk_bs_alloc_io_channel(bs);
 	if (channel == NULL) {
-		rc = -ENOMEM;
 		goto exit;
 	}
 
@@ -1995,7 +1990,6 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 
 	tctx->seq = bs_sequence_start(channel, &cpl);
 	if (tctx->seq == NULL) {
-		rc = -ENOMEM;
 		goto exit;		
 	}
 
@@ -2009,7 +2003,8 @@ blob_touch_cluster_copy(uint64_t start_slice, uint32_t count,
 exit:
 	free_touch_cluster_ctx(tctx);
 	ctx->outstanding_ops--;
-	bs_reclaim_cluster_iter(ctx, rc);
+	ctx->current->on_process = false;
+	free(ctx);
 }
 
 static void
@@ -2058,8 +2053,9 @@ blob_touch_clone_cluster(struct spdk_blob *clone, reclaim_cluster_ctx *ctx)
 	}
 
 	/* slices of this cluster in this clone are all valid
-	no need to copy data, move to next iteration */
-	bs_reclaim_cluster_iter(ctx, 0);
+	no need to copy data, exit and wait for next poll */
+	ctx->current->on_process = false;
+	free(ctx);
 }
 
 static struct cluster_to_reclaim*
@@ -2161,9 +2157,11 @@ bs_reclaim_cluster_iter(reclaim_cluster_ctx *ctx, int bserrno)
 			case -ENOMEM:
 			case -EACCES:
 				/* lack of resources, wait for next time */
+				target->on_process = false;
 				free(ctx);
 				return;
 			default:
+				target->on_process = false;
 				free(ctx);
 				return;
 		}
@@ -2309,7 +2307,8 @@ bs_init_background_reclaim(struct spdk_blob_store *bs)
 
 	resource_reclaimer->name = "resource-reclaimer";
 	/* Here to control background reclaim */
-	resource_reclaimer->scaledIOPS = resource_reclaimer->tokens = RECLAIM_TOKENS;
+	resource_reclaimer->scaledIOPS = RECLAIM_TOKENS;
+	resource_reclaimer->tokens = RECLAIM_TOKENS;
 	TAILQ_INSERT_TAIL(&bs->tenants, resource_reclaimer, link);
 
 	return 0;
@@ -2401,12 +2400,14 @@ bs_token_generate(void *arg)
 	uint64_t cur_ticks = spdk_get_ticks();
 	struct spdk_blob_store *bs = arg;
 	token_tenant *tenant;
+	double time_delta, tokens_supplied;
 
 	/* measured in seconds */
-	uint64_t time_delta = (cur_ticks - prev_ticks) / spdk_get_ticks_hz();
+	time_delta = (double)(cur_ticks - prev_ticks) / spdk_get_ticks_hz();
 
 	TAILQ_FOREACH(tenant, &bs->tenants, link) {
-		tenant->tokens += time_delta * tenant->scaledIOPS;
+		tokens_supplied = time_delta * tenant->scaledIOPS;
+		tenant->tokens += (uint64_t)tokens_supplied;
 		tenant->tokens = spdk_min(tenant->tokens, tenant->scaledIOPS);
 	}
 
