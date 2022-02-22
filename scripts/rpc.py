@@ -1575,7 +1575,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                      lvs_name=args.lvs_name,
                                                      cluster_sz=args.cluster_sz,
                                                      slice_sz=args.slice_sz,
-                                                     clear_method=args.clear_method))
+                                                     clear_method=args.clear_method,
+                                                     write_factor=args.write_factor))
 
     p = subparsers.add_parser('bdev_lvol_create_lvstore', aliases=['construct_lvol_store'],
                               help='Add logical volume store on base bdev')
@@ -1585,6 +1586,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-s', '--slice-sz', help='size of slice (in bytes)', type=int, required=False)
     p.add_argument('--clear-method', help="""Change clear method for data region.
         Available: none, unmap, write_zeroes""", required=False)
+    p.add_argument('-w', '--write-factor', help='NVMe SSD write fatocr', required=False)
     p.set_defaults(func=bdev_lvol_create_lvstore)
 
     def bdev_lvol_rename_lvstore(args):
