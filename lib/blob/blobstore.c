@@ -1089,6 +1089,10 @@ blob_cow_persist_valid_slices(struct blob_io_ctx *ctx)
 		return;
 	}
 	ctx->cow_ctx.outstanding_md_ops++;
+
+	cur_phy_slice = bs_logic_slice_to_physical(blob, ctx->end_slice);
+	cur_page = bs_slice_to_md_page(blob->bs, cur_phy_slice);
+	
 	blob_serialize_slice_page(blob, cur_phy_slice, ctx->cow_ctx.eles[j]->buf);
 	bs_sequence_write_dev(ctx->cow_ctx.seq, ctx->cow_ctx.eles[j]->buf, 
 			bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + cur_page),
