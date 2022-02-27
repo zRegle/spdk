@@ -177,7 +177,7 @@ typedef struct {
 } mem_pool_factory;
 
 struct cluster_to_reclaim {
-	struct spdk_blob *blob;
+	struct spdk_blob *snap;
 	uint64_t cluster_idx;
 	spdk_blob_id cur_child; /* clone that copy data */
 	bool on_process;
@@ -343,6 +343,8 @@ struct spdk_blob {
 	struct rb_root slice_sequencers_tree;
 	uint64_t total_ref_cnt;
 	bool init_reclaim;
+	uint32_t outstanding_reclaim_op;
+	bool ready_to_del;
 };
 
 struct spdk_blob_store {

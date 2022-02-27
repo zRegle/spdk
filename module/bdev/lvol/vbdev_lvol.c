@@ -1468,7 +1468,7 @@ vbdev_destroy_hidden_snapshot(void *arg)
 	TAILQ_FOREACH_FROM_SAFE(snap, &lvs->hidden_lvols, next, tsnap) {
 		spdk_blob_get_clones(lvs->blobstore, snap->blob_id, NULL, &clone_count);
 		if (clone_count > 0) {
-			if (spdk_blob_ref_cnt(snap->blob) == 0) {
+			if (spdk_snap_ready_to_del(snap->blob) == true) {
 				/* ref count is zero, ready to destory */
 				TAILQ_REMOVE(&lvs->hidden_lvols, snap, next);
 				ids = calloc(clone_count, sizeof(spdk_blob_id));

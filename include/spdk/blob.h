@@ -61,6 +61,7 @@
 #define SPDK_BLOB_H
 
 #include "spdk/stdinc.h"
+#include "util.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,7 +70,7 @@ extern "C" {
 typedef uint64_t spdk_blob_id;
 #define SPDK_BLOBID_INVALID	(uint64_t)-1
 #define SPDK_BLOBSTORE_TYPE_LENGTH 16
-#define RECLAIM_POLL_INTERVAL (120 * 1000)
+#define RECLAIM_POLL_INTERVAL (1 * SPDK_SEC_TO_USEC)
 
 enum blob_clear_method {
 	BLOB_CLEAR_WITH_DEFAULT,
@@ -1001,6 +1002,7 @@ void spdk_bs_get_mask(struct spdk_blob_store *bs, struct spdk_bs_mask_info **inf
 				enum bs_mask_type type, int *bserrno);
 void spdk_snapshot_blob_hide(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 uint64_t spdk_blob_ref_cnt(struct spdk_blob *snap);
+bool spdk_snap_ready_to_del(struct spdk_blob *snap);
 
 typedef struct {
 	uint32_t token_rate;
