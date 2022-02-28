@@ -89,7 +89,7 @@ bs_compute_request_cost(struct spdk_blob_store *bs, uint32_t size, enum spdk_blo
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
 // #define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
 #define TOKEN_GENERATE_PERIOD SPDK_SEC_TO_USEC
-#define RECLAIM_TOKENS ((110 * 1000))
+#define RECLAIM_TOKENS ((60 * 1000))
 #define COMMON_TOKENS ((240 * 1000))
 #define READ_TOKEN 10
 
@@ -1092,7 +1092,7 @@ blob_cow_persist_valid_slices(struct blob_io_ctx *ctx)
 
 	cur_phy_slice = bs_logic_slice_to_physical(blob, ctx->end_slice);
 	cur_page = bs_slice_to_md_page(blob->bs, cur_phy_slice);
-	
+
 	blob_serialize_slice_page(blob, cur_phy_slice, ctx->cow_ctx.eles[j]->buf);
 	bs_sequence_write_dev(ctx->cow_ctx.seq, ctx->cow_ctx.eles[j]->buf, 
 			bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + cur_page),
@@ -1706,7 +1706,7 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			rc = bs_allocate_cluster(blob, cluster_num, &ctx->cow_ctx.new_cluster, 
 							&ctx->cow_ctx.new_extent_page, false);
 			if (rc < 0) {
-				SPDK_ERRLOG("allocate cluster failed\n");
+				SPDK_ERRLOG("allocate cluster failed, rc %d\n", rc);
 				pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
 				goto cleanup;
 			}
@@ -1800,7 +1800,7 @@ blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
 		}
 
 		snap->bs->resource_reclaim_cnt++;
-		printf("background reclaim %lu\n", snap->bs->resource_reclaim_cnt);
+		// printf("background reclaim %lu\n", snap->bs->resource_reclaim_cnt);
 
 		if (snap->active.ref_cnt[target->cluster_idx] == 0) {
 			/* ref_cnt is zero, no need to copy data anymore
@@ -2190,6 +2190,7 @@ bs_reclaim_cluster(reclaim_cluster_ctx *ctx, int bserrno)
 					return NO_REQ;
 				}
 				ctx->current = target;
+				break;
 			default:
 				bs_resource_reclaim_end_req(ctx);
 				return NO_REQ;
