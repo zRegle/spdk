@@ -89,9 +89,9 @@ bs_compute_request_cost(struct spdk_blob_store *bs, uint32_t size, enum spdk_blo
 #define BWRAID_EXTENT_ENTRY_PER_PAGE (4072 / sizeof(uint32_t))
 // #define DATA_COPY_THRESHOLD (64 * 1024 * 1024 / 512)
 #define TOKEN_GENERATE_PERIOD SPDK_SEC_TO_USEC
-#define RECLAIM_TOKENS ((60 * 1000))
-#define COMMON_TOKENS ((240 * 1000))
 #define READ_TOKEN 10
+#define RECLAIM_TOKENS ((60 * 1000))
+#define COMMON_TOKENS ((280 * 1000) * READ_TOKEN)
 
 enum slice_status {
 	ERROR = -2,
@@ -1665,12 +1665,27 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 	uint64_t cluster_num;
 	bool is_allocated;
 	int rc;
+	uint64_t request_bytes;
+	uint32_t tokens_demand;
 
 	ctx = blob_io_ctx_init(blob, _channel, iov, iovcnt, 
 					offset, length, cb_fn, cb_arg, read, tag);
 	if (ctx == NULL) {
 		cb_fn(cb_arg, -ENOMEM);
 		return;
+	}
+
+	if (ctx->tag == COMMON) {
+		request_bytes = length * blob->bs->io_unit_size;
+		if (read) {
+			tokens_demand = bs_compute_request_cost(blob->bs, request_bytes, SPDK_BLOB_READV);
+		} else {
+			tokens_demand = bs_compute_request_cost(blob->bs, request_bytes, SPDK_BLOB_WRITEV);
+		}
+		if (!bs_tenant_io_control(blob->bs, tokens_demand, COMMON)) {
+			cb_fn(cb_arg, -EAGAIN);
+			return;
+		}
 	}
 
 	is_allocated = bs_io_unit_is_allocated(blob, offset);
@@ -1820,7 +1835,7 @@ blob_touch_cluster_copy_cpl(void *cb_arg, int bserrno)
 static inline uint32_t
 bs_compute_request_cost(struct spdk_blob_store *bs, uint32_t size, enum spdk_blob_op_type type)
 {
-	uint32_t size_scale_factor = spdk_divide_round_up(size, SPDK_BS_PAGE_SIZE);
+	uint32_t size_scale_factor = spdk_divide_round_up(size, 0x1000);
 
 	switch (type) {
 	case SPDK_BLOB_READV:
@@ -1933,10 +1948,10 @@ blob_touch_cluster_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 		return;
 	}
 	
-	channel = spdk_bs_alloc_io_channel(ctx->clone->bs);
+	channel = spdk_bs_alloc_io_channel(clone->bs);
 	assert(channel != NULL);
 
-	count = ctx->length * clone->bs->io_unit_size / clone->bs->slice_sz;
+	count = ctx->length * bs->io_unit_size / bs->slice_sz;
 	assert(count > 0);
 	for (i = 0; i < count; i++) {
 		assert(ctx->sequencers[i]->read_count > 0);
@@ -2291,7 +2306,7 @@ bs_compute_reclaim_scaleIOPS(struct spdk_blob_store *bs)
 static int
 bs_init_background_reclaim(struct spdk_blob_store *bs)
 {
-	token_tenant *resource_reclaimer;
+	// token_tenant *resource_reclaimer;
 	uint64_t reclaim_qps;
 	uint64_t poll_interval; //measured in us
 	int rc;
@@ -5894,23 +5909,22 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 		goto exit;
 	}
 
-	// TAILQ_INIT(&bs->tenants);
-	// bs->token_generator = SPDK_POLLER_REGISTER(bs_token_generate, bs, TOKEN_GENERATE_PERIOD);
-	// if (bs->token_generator == NULL) {
-	// 	SPDK_ERRLOG("register poller failed\n");
-	// 	goto exit;
-	// }
+	TAILQ_INIT(&bs->tenants);
+	bs->token_generator = SPDK_POLLER_REGISTER(bs_token_generate, bs, TOKEN_GENERATE_PERIOD);
+	if (bs->token_generator == NULL) {
+		SPDK_ERRLOG("register poller failed\n");
+		goto exit;
+	}
 
-	// token_tenant *tenant;
-	// tenant = calloc(1, sizeof(*tenant));
-	// if (tenant == NULL) {
-	// 	goto exit;
-	// }
-	// pthread_mutex_init(&tenant->token_lock, NULL);
-	// tenant->name = "common";
-	// tenant->tokens = COMMON_TOKENS;
-	// tenant->scaledIOPS = COMMON_TOKENS;
-	// TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
+	token_tenant *tenant;
+	tenant = calloc(1, sizeof(*tenant));
+	if (tenant == NULL) {
+		goto exit;
+	}
+	pthread_mutex_init(&tenant->token_lock, NULL);
+	tenant->name = "common";
+	tenant->tokens = tenant->scaledIOPS = COMMON_TOKENS;
+	TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
 
 	*_ctx = ctx;
 	*_bs = bs;
@@ -5927,7 +5941,7 @@ exit:
 	spdk_free(ctx->super);
 	free(ctx);
 	bs_mem_factory_destroy(bs);
-	// spdk_poller_unregister(&bs->token_generator);
+	spdk_poller_unregister(&bs->token_generator);
 	free(bs);
 	/* FIXME: this is a lie but don't know how to get a proper error code here */
 	return -ENOMEM;
