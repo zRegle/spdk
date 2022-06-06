@@ -3,6 +3,9 @@
 SCRIPTS=$(cd `dirname $0`;pwd)
 RPC=$SCRIPTS/rpc.py
 
+iscsiadm -m node --logout
+iscsiadm -m node -o delete
+
 $RPC spdk_kill_instance SIGTERM &> /dev/null
 
 sleep 3

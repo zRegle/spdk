@@ -815,6 +815,7 @@ blob_insert_cluster_cb(void *cb_arg, int bserrno)
 	/* wake up all pending ios */
 	sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
 	assert(sequencer != NULL);
+	assert(sequencer->mapping_io == ctx);
 	TAILQ_FOREACH_FROM_SAFE(pending_io, &sequencer->pending_ios, link, tio) {
 		TAILQ_REMOVE(&sequencer->pending_ios, pending_io, link);
 		blob_prepare_io(pending_io);
@@ -920,16 +921,13 @@ blob_copy_on_write_cpl(void *arg, int bserrno)
 
 #ifdef DEBUG
 	float total = ctx->statistics.read + ctx->statistics.write + ctx->statistics.md;
-	// printf("offset %lu, length %lu, slice %lu cow: read %.3f, write %.3f, md %.3f, total %.3f\n", 
-	// 			ctx->offset, ctx->length, TAILQ_FIRST(&ctx->sequencers)->seq->slice,
-	// 			ctx->statistics.read, ctx->statistics.write, ctx->statistics.md, total);
-	
-	struct spdk_blob_store *bs = ctx->blob->bs;
-	bs->slice.cnt++;
-	bs->slice.u.cow_io.total += total;
-	bs->slice.u.cow_io.read += ctx->statistics.read;
-	bs->slice.u.cow_io.write += ctx->statistics.write;
-	bs->slice.u.cow_io.md += ctx->statistics.md;
+
+	// struct spdk_blob_store *bs = ctx->blob->bs;
+	// bs->slice.cnt++;
+	// bs->slice.u.cow_io.total += total;
+	// bs->slice.u.cow_io.read += ctx->statistics.read;
+	// bs->slice.u.cow_io.write += ctx->statistics.write;
+	// bs->slice.u.cow_io.md += ctx->statistics.md;
 #endif
 
 	TAILQ_FOREACH_FROM_SAFE(node, &ctx->sequencers, link, tnode) {
@@ -1072,9 +1070,9 @@ blob_cow_persist_valid_slices(struct blob_io_ctx *ctx)
 			ctx->cow_ctx.outstanding_md_ops++;
 			blob_serialize_slice_page(blob, prev_phy_slice, ctx->cow_ctx.eles[j]->buf);
 			bs_sequence_write_dev(ctx->cow_ctx.seq, ctx->cow_ctx.eles[j]->buf, 
-					bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + prev_page),
-					bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
-					blob_cow_persist_valid_slices_cb, ctx);
+			 		bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + prev_page),
+			 		bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
+			 		blob_cow_persist_valid_slices_cb, ctx);
 			
 			prev_page = cur_page;
 			j++;
@@ -1095,9 +1093,9 @@ blob_cow_persist_valid_slices(struct blob_io_ctx *ctx)
 
 	blob_serialize_slice_page(blob, cur_phy_slice, ctx->cow_ctx.eles[j]->buf);
 	bs_sequence_write_dev(ctx->cow_ctx.seq, ctx->cow_ctx.eles[j]->buf, 
-			bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + cur_page),
-			bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
-			blob_cow_persist_valid_slices_cb, ctx);
+	 		bs_page_to_lba(blob->bs, blob->bs->valid_slices_mask_start + cur_page),
+	 		bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
+	 		blob_cow_persist_valid_slices_cb, ctx);
 
 #ifdef DEBUG
 	blob_io_ctx_statistics(&ctx->statistics.ts, false);
@@ -1675,18 +1673,18 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		return;
 	}
 
-	if (ctx->tag == COMMON) {
-		request_bytes = length * blob->bs->io_unit_size;
-		if (read) {
-			tokens_demand = bs_compute_request_cost(blob->bs, request_bytes, SPDK_BLOB_READV);
-		} else {
-			tokens_demand = bs_compute_request_cost(blob->bs, request_bytes, SPDK_BLOB_WRITEV);
-		}
-		if (!bs_tenant_io_control(blob->bs, tokens_demand, COMMON)) {
-			cb_fn(cb_arg, -EAGAIN);
-			return;
-		}
-	}
+	// if (ctx->tag == COMMON) {
+	// 	request_bytes = length * blob->bs->io_unit_size;
+	// 	if (read) {
+	// 		tokens_demand = bs_compute_request_cost(blob->bs, request_bytes, SPDK_BLOB_READV);
+	// 	} else {
+	// 		tokens_demand = bs_compute_request_cost(blob->bs, request_bytes, SPDK_BLOB_WRITEV);
+	// 	}
+	// 	if (!bs_tenant_io_control(blob->bs, tokens_demand, COMMON)) {
+	// 		cb_fn(cb_arg, -EAGAIN);
+	// 		return;
+	// 	}
+	// }
 
 	is_allocated = bs_io_unit_is_allocated(blob, offset);
 	cluster_num = bs_io_unit_to_cluster_number(blob, offset);
@@ -1696,7 +1694,7 @@ blob_start_io(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			/* mapping IO unfinished */
 			sequencer = blob_get_mapping_sequencer(&blob->cluster_sequencers_tree, cluster_num);
 			assert(sequencer != NULL);
-			assert(sequencer->mapping_io != NULL);
+			assert(sequencer->mapping_io != NULL); //FIXME: -m 0xf, assert failed
 			/* wait until mapping IO finish */
 			TAILQ_INSERT_TAIL(&sequencer->pending_ios, ctx, link);
 		#ifdef DEBUG
@@ -5607,13 +5605,13 @@ bs_dev_destroy(void *io_device)
 	bs_call_cpl(&bs->unload_cpl, bs->unload_err);
 
 	bs_mem_factory_destroy(bs);
-	spdk_poller_unregister(&bs->token_generator);
-	spdk_poller_unregister(&bs->reclaim_poller);
-	TAILQ_FOREACH_SAFE(tenant, &bs->tenants, link, ttmp) {
-		TAILQ_REMOVE(&bs->tenants, tenant, link);
-		pthread_mutex_destroy(&tenant->token_lock);
-		free(tenant);
-	}
+	// spdk_poller_unregister(&bs->token_generator);
+	// spdk_poller_unregister(&bs->reclaim_poller);
+	// TAILQ_FOREACH_SAFE(tenant, &bs->tenants, link, ttmp) {
+	// 	TAILQ_REMOVE(&bs->tenants, tenant, link);
+	// 	pthread_mutex_destroy(&tenant->token_lock);
+	// 	free(tenant);
+	// }
 
 	free(bs);
 }
@@ -5909,22 +5907,22 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 		goto exit;
 	}
 
-	TAILQ_INIT(&bs->tenants);
-	bs->token_generator = SPDK_POLLER_REGISTER(bs_token_generate, bs, TOKEN_GENERATE_PERIOD);
-	if (bs->token_generator == NULL) {
-		SPDK_ERRLOG("register poller failed\n");
-		goto exit;
-	}
+	// TAILQ_INIT(&bs->tenants);
+	// bs->token_generator = SPDK_POLLER_REGISTER(bs_token_generate, bs, TOKEN_GENERATE_PERIOD);
+	// if (bs->token_generator == NULL) {
+	// 	SPDK_ERRLOG("register poller failed\n");
+	// 	goto exit;
+	// }
 
-	token_tenant *tenant;
-	tenant = calloc(1, sizeof(*tenant));
-	if (tenant == NULL) {
-		goto exit;
-	}
-	pthread_mutex_init(&tenant->token_lock, NULL);
-	tenant->name = "common";
-	tenant->tokens = tenant->scaledIOPS = COMMON_TOKENS;
-	TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
+	// token_tenant *tenant;
+	// tenant = calloc(1, sizeof(*tenant));
+	// if (tenant == NULL) {
+	// 	goto exit;
+	// }
+	// pthread_mutex_init(&tenant->token_lock, NULL);
+	// tenant->name = "common";
+	// tenant->tokens = tenant->scaledIOPS = COMMON_TOKENS;
+	// TAILQ_INSERT_TAIL(&bs->tenants, tenant, link);
 
 	*_ctx = ctx;
 	*_bs = bs;
